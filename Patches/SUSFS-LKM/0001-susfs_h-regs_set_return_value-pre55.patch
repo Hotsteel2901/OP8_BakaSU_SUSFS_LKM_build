@@ -1,5 +1,5 @@
 diff --git a/kernel/susfs.h b/kernel/susfs.h
-index 69e4605..fb40cad 100644
+index 69e4605..46d7490 100644
 --- a/kernel/susfs.h
 +++ b/kernel/susfs.h
 @@ -6,6 +6,7 @@
@@ -10,7 +10,7 @@ index 69e4605..fb40cad 100644
  
  /* ---- pre-5.10 portability shims (legacy branch; see LEGACY_PORTING.md) ----
   *
-@@ -53,6 +54,16 @@
+@@ -53,6 +54,22 @@
  # endif
  #endif /* < 5.10 */
  
@@ -22,6 +22,12 @@ index 69e4605..fb40cad 100644
 +{
 +	regs->regs[0] = val;
 +}
++#endif
++
++/* task_work_add() took a bool ("notify") before the TWA_* enum; the enum value TWA_RESUME
++ * (1) equals the old notify=true. Used by susfs_supercall.c. */
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 7, 0) && !defined(TWA_RESUME)
++#define TWA_RESUME true
 +#endif
 +
  /* A kernel pointer taken out of a kprobe register, checked before dereference: single_open()'s fake inode is (void *)1

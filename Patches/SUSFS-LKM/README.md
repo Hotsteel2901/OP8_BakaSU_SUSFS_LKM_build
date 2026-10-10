@@ -72,7 +72,7 @@ SUSFS 可以独立升级、不依赖 in-tree SUSFS 补丁（也绕开上游 Baka
 
 | 补丁 | 解决问题 |
 |---|---|
-| `0001-susfs_h-regs_set_return_value-pre55.patch` | 4.19 arm64 没有 `regs_set_return_value()`（`sus_map.c`/`sus_path.c`/`susfs_hide_syms.c` 用到）。在 `susfs.h` 加 `< 5.5` 的 arm64 内联实现（`regs->regs[0] = val`）。 |
+| `0001-susfs_h-regs_set_return_value-pre55.patch` | 4.19 arm64 没有 `regs_set_return_value()`（`sus_map.c`/`sus_path.c`/`susfs_hide_syms.c` 用到）→ 在 `susfs.h` 加 `< 5.5` 的 arm64 内联实现（`regs->regs[0] = val`）；并在同一处补 `< 5.7` 的 `TWA_RESUME`（`susfs_supercall.c` 用 `task_work_add(..., TWA_RESUME)`，4.19 是 `bool notify`）。 |
 | `0002-sus_path-drop-path_notify-pre52.patch` | `path_notify` 是 5.2+ 的 LSM hook，4.19 的 `security_hook_heads`/`security_list_options` 没有该成员。按 `>= 5.2` 门控掉该 hook（前向声明、静态断言、hook 结构体、处理函数、注册/注销列表项），4.19 上不安装它。 |
 | `0003-susfs_kstat-syscall_get_arguments-5args.patch` | 本 4.19 树的 arm64 `syscall_get_arguments` 是 **5 参**形式 `(task, regs, i, n, args)`，而源码用的是 3 参。改为 `(current, regs, 0, 6, args)`。 |
 
