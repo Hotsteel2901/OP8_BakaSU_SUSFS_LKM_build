@@ -66,10 +66,20 @@ SUSFS 可以独立升级、不依赖 in-tree SUSFS 补丁（也绕开上游 Baka
 5. 加载即重启时要收 `/sys/fs/pstore/console-ramoops-0`（kCFI 原型不符会 panic；
    4.19 无 CFI，风险主要在文本补丁/结构体布局）。
 
-## 待办 / 迭代方式
+## 已应用补丁
 
-- 目前本目录**尚未放入补丁**：4.19 适配需要对着真实编译错误逐条修，盲写补丁应用不上。
-- 迭代流程：跑一次 `build-lkm.yml` → 看 `Build SUSFS-LKM` 步骤的编译错误 →
-  在本目录加/改补丁 → 重跑。构建步骤已把失败原因指回本文件。
+按 CI 编译错误逐条补齐（工作流按文件名顺序应用）：
+
+| 补丁 | 解决问题 |
+|---|---|
+| `0001-susfs_h-regs_set_return_value-pre55.patch` | 4.19 arm64 没有 `regs_set_return_value()`（`sus_map.c`/`sus_path.c`/`susfs_hide_syms.c` 用到）。在 `susfs.h` 加 `< 5.5` 的 arm64 内联实现（`regs->regs[0] = val`）。 |
+| `0002-sus_path-drop-path_notify-pre52.patch` | `path_notify` 是 5.2+ 的 LSM hook，4.19 的 `security_hook_heads`/`security_list_options` 没有该成员。按 `>= 5.2` 门控掉该 hook（前向声明、静态断言、hook 结构体、处理函数、注册/注销列表项），4.19 上不安装它。 |
+| `0003-susfs_kstat-syscall_get_arguments-5args.patch` | 本 4.19 树的 arm64 `syscall_get_arguments` 是 **5 参**形式 `(task, regs, i, n, args)`，而源码用的是 3 参。改为 `(current, regs, 0, 6, args)`。 |
+
+## 迭代方式
+
+- 每次跑 `build-lkm.yml` → 看 `Build SUSFS-LKM` 失败时打出的 `::error::` 编译错误 →
+  在本目录加/改补丁 → 重跑。
+- 本目录的 `*.patch` 会在克隆 `susfs_lkm` 之后、构建之前按文件名顺序 `patch -p1` 应用；失败即整条构建失败。
 - 上游仍在活跃修 dirent/kprobe（`fix/dirent-buffer-residue`、`fix/kprobe-rearm`），
   跟进时注意 `susfs_lkm_ref` 固定到具体 commit 更可复现。

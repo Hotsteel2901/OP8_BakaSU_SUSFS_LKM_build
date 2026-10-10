@@ -1,0 +1,29 @@
+diff --git a/kernel/susfs.h b/kernel/susfs.h
+index 69e4605..fb40cad 100644
+--- a/kernel/susfs.h
++++ b/kernel/susfs.h
+@@ -6,6 +6,7 @@
+ #include <linux/err.h>	/* IS_ERR */
+ #include <linux/mm.h>	/* PAGE_SIZE */
+ #include <linux/version.h>	/* LINUX_VERSION_CODE for the pre-5.10 shims below */
++#include <asm/ptrace.h>		/* struct pt_regs, for the regs_set_return_value shim */
+ 
+ /* ---- pre-5.10 portability shims (legacy branch; see LEGACY_PORTING.md) ----
+  *
+@@ -53,6 +54,16 @@
+ # endif
+ #endif /* < 5.10 */
+ 
++/* regs_set_return_value() is per-arch and only appeared in 5.5; arm64 4.19 has no such
++ * helper (arch/arm64/include/asm/syscall.h defines only syscall_get/set_return_value).
++ * It is used by sus_map / sus_path / susfs_hide_syms, all of which include this header. */
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 5, 0) && defined(CONFIG_ARM64)
++static inline void regs_set_return_value(struct pt_regs *regs, unsigned long val)
++{
++	regs->regs[0] = val;
++}
++#endif
++
+ /* A kernel pointer taken out of a kprobe register, checked before dereference: single_open()'s fake inode is (void *)1
+  * and a kretprobe hands that sentinel over as "the argument" - the sus_map vma probe panicked on exactly that (fault
+  * address 0xa1) until this test existed.  Every kernel object lives above the first page, so "< PAGE_SIZE" covers a
