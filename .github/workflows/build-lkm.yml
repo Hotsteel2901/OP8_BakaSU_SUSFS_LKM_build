@@ -324,21 +324,25 @@ jobs:
 
       - name: Build ksuinit (aarch64, for ramdisk injection)
         run: |
-          cd bakasu
+          # BakaSU 没有 workspace 根 Cargo.toml（backslashxx 有，所以那边能 `--package`）。
+          # ksuinit / ksud 是两个独立 crate，必须进各自目录构建。
+          cd bakasu/userspace/ksuinit
           export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
           export CARGO_PROFILE_RELEASE_LTO=false
-          cargo build --package ksuinit --target=aarch64-unknown-linux-musl --release -j"$JOBS"
-          mkdir -p userspace/ksud/bin/aarch64
-          cp target/aarch64-unknown-linux-musl/release/ksuinit userspace/ksud/bin/aarch64/ksuinit
-          file userspace/ksud/bin/aarch64/ksuinit
+          cargo build --target=aarch64-unknown-linux-musl --release -j"$JOBS"
+          mkdir -p ../ksud/bin/aarch64
+          cp target/aarch64-unknown-linux-musl/release/ksuinit ../ksud/bin/aarch64/ksuinit
+          file ../ksud/bin/aarch64/ksuinit
 
       - name: Patch ksud (allow boot header v2) and build host ksud
         run: |
           cd bakasu
           patch -p1 < "$GITHUB_WORKSPACE/Patches/ksud-v2.patch"
+          # 同上：ksud 是独立 crate，进它自己的目录构建（不是 workspace --package）。
+          cd userspace/ksud
           export CARGO_PROFILE_RELEASE_LTO=false
           export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
-          cargo build --package ksud --release -j"$JOBS"
+          cargo build --release -j"$JOBS"
           ./target/release/ksud --version
 
       - name: Build BakaSU LKM driver (kernelsu.ko)
@@ -391,18 +395,12 @@ jobs:
             base_out/boot.img \
             device_kernel/out/arch/arm64/boot/Image \
             out_img/swapped.img
-          bakasu/target/release/ksud boot-patch \
+          # BakaSU 的 boot-patch 参数与 backslashxx 不同：没有 --arch（用 --kmi 自动检测），
+          # 用 --boot/--module/--out。输出名为 kernelsu_patched_<timestamp>.img。
+          bakasu/userspace/ksud/target/release/ksud boot-patch \
             --boot out_img/swapped.img \
             --module bakasu/kernel/kernelsu.ko \
-            --arch aarch64 \
-            --out out_img/ || {
-              echo "::warning::ksud boot-patch failed; trying backslashxx-style argument names"
-              bakasu/target/release/ksud boot-patch \
-                --bootimg out_img/swapped.img \
-                --module bakasu/kernel/kernelsu.ko \
-                --arch aarch64 \
-                --out out_img/
-            }
+            --out out_img/
           ls -la out_img/
 
       - name: Verify final boot.img
