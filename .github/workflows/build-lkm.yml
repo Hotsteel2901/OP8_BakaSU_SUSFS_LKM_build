@@ -329,7 +329,14 @@ jobs:
           cd bakasu/userspace/ksuinit
           export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
           export CARGO_PROFILE_RELEASE_LTO=false
-          cargo build --target=aarch64-unknown-linux-musl --release -j"$JOBS"
+          set -o pipefail
+          cargo build --target=aarch64-unknown-linux-musl --release -j"$JOBS" 2>&1 | tee /tmp/ksuinit_build.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::ksuinit build failed (rc=$rc)"
+            grep -nE 'error\[|^error:|cannot find|failed to|not found|does not have' /tmp/ksuinit_build.log | tail -25 | while IFS= read -r l; do echo "::error::$l"; done
+            exit 1
+          fi
           mkdir -p ../ksud/bin/aarch64
           cp target/aarch64-unknown-linux-musl/release/ksuinit ../ksud/bin/aarch64/ksuinit
           file ../ksud/bin/aarch64/ksuinit
@@ -342,7 +349,14 @@ jobs:
           cd userspace/ksud
           export CARGO_PROFILE_RELEASE_LTO=false
           export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
-          cargo build --release -j"$JOBS"
+          set -o pipefail
+          cargo build --release -j"$JOBS" 2>&1 | tee /tmp/ksud_build.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::ksud build failed (rc=$rc)"
+            grep -nE 'error\[|^error:|cannot find|failed to|not found|does not have' /tmp/ksud_build.log | tail -25 | while IFS= read -r l; do echo "::error::$l"; done
+            exit 1
+          fi
           ./target/release/ksud --version
 
       - name: Build BakaSU LKM driver (kernelsu.ko)
@@ -352,10 +366,17 @@ jobs:
           # depends on KSU != m，因此 LKM 走它自己的 syscall hook 机制
           # (hook/syscall_hook_manager.c, kretprobe + syscall tracepoints)，
           # 内核侧需 CONFIG_KPROBES/KRETPROBES + FTRACE_SYSCALLS（已在 config 步骤开启）。
+          set -o pipefail
           make -C "$GITHUB_WORKSPACE/device_kernel" O="$GITHUB_WORKSPACE/device_kernel/out" M="$PWD" \
             CONFIG_KSU=m CONFIG_KSU_TRACEPOINT_HOOK=y \
             CC=clang ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
-            -j"$JOBS" modules
+            -j"$JOBS" modules 2>&1 | tee /tmp/ksu_build.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::BakaSU kernelsu.ko build failed (rc=$rc)"
+            grep -nE 'error:|fatal error:|Error [0-9]|undefined reference|No such file|No rule to make' /tmp/ksu_build.log | tail -25 | while IFS= read -r l; do echo "::error::$l"; done
+            exit 1
+          fi
           ls -la kernelsu.ko
           strings kernelsu.ko | grep -m1 '^vermagic' || true
 
@@ -364,13 +385,18 @@ jobs:
           cd susfs_lkm/kernel
           # 外置构建，针对同一个已准备的内核树。SUSFS-LKM 通过运行时符号解析 +
           # 自身 /proc 接口工作，未定义符号由 ksud 加载时从 /proc/kallsyms 解析。
+          # ⚠️ 4.19 适配进行中（上游 legacy 未编译未验证）：本步失败时把关键错误行以
+          # ::error:: 输出，便于在 CI annotations 里定位（见 Patches/SUSFS-LKM/README.md）。
+          set -o pipefail
           make -C "$GITHUB_WORKSPACE/device_kernel" O="$GITHUB_WORKSPACE/device_kernel/out" M="$PWD" \
             CC=clang ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
-            -j"$JOBS" modules || {
-              echo "::error::SUSFS-LKM build failed. See Patches/SUSFS-LKM/README.md for the 4.19 porting map;"
-              echo "::error::this target is still being adapted for 4.19 (legacy branch is unbuilt upstream)."
-              exit 1
-            }
+            -j"$JOBS" modules 2>&1 | tee /tmp/susfs_build.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::SUSFS-LKM build failed (rc=$rc) — 4.19 adaptation in progress; see Patches/SUSFS-LKM/README.md"
+            grep -nE 'error:|fatal error:|Error [0-9]|undefined reference|No such file|No rule to make|incompatible|implicit declaration' /tmp/susfs_build.log | tail -30 | while IFS= read -r l; do echo "::error::$l"; done
+            exit 1
+          fi
           ls -la susfs_guard_lkm.ko
 
       - name: Obtain base boot.img (v2)
