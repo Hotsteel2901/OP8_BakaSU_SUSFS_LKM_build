@@ -1,0 +1,420 @@
+name: Build 4.19 BakaSU LKM Kernel + SUSFS-LKM (OnePlus 8 / LOS 23.2)
+
+# 基于 Hotsteel2901/OP8_KSU_LKM_build（已验证可用，管理器 = backslashxx/KernelSU）改造：
+#   - 管理器换成 BakaSU（Baka-SU/BakaSU，main 分支）
+#   - 额外构建 4.19 的 SUSFS-LKM（Hotsteel2901/susfs4ksu-lkm 的 legacy 分支 + 本仓库
+#     Patches/SUSFS-LKM/*.patch 的 4.19 适配）
+# 产出：
+#   - boot.img（header v2，已注入 BakaSU 的 ksuinit + kernelsu.ko）
+#   - kernelsu.ko（BakaSU LKM 驱动）
+#   - susfs_guard_lkm.ko（SUSFS-LKM，运行时加载）
+#
+# 参考仓库的关键机制：ksud 在加载 .ko 时会用 /proc/kallsyms 预解析未定义符号并改写
+# vermagic，所以外置模块可以用运行时解析的符号（SUSFS-LKM 正是这样设计的）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      boot_img_url:
+        description: 'Base boot.img URL (v2 header, OnePlus 8 / kebab / LOS 23.2)'
+        required: false
+        type: string
+      kernel_commit:
+        description: 'Kernel ref to pull: branch or commit SHA (default: lineage-23.2 = latest)'
+        required: false
+        type: string
+        default: 'lineage-23.2'
+      patch_base:
+        description: 'Fallback kernel commit if DS/RK patches fail on latest'
+        required: false
+        type: string
+        default: '4238ee49a84b'
+      manager_ref:
+        description: 'BakaSU ref (branch/tag/commit) to pull'
+        required: false
+        type: string
+        default: 'main'
+      susfs_lkm_ref:
+        description: 'SUSFS-LKM ref (branch/tag/commit) to pull'
+        required: false
+        type: string
+        default: 'legacy'
+      vfs_hybridmount:
+        description: 'VFS backend: Hybrid Mount (mutually exclusive with NoMount)'
+        required: false
+        type: boolean
+        default: false
+      vfs_nomount:
+        description: 'VFS backend: NoMount (mutually exclusive with Hybrid Mount)'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  # Device
+  DEVICE: 'OnePlus 8 (instantnoodle)'
+  KERNEL_SOURCE: 'https://github.com/LineageOS/android_kernel_oneplus_sm8250.git'
+  KERNEL_BRANCH: 'lineage-23.2'
+  KERNEL_REF: ${{ inputs.kernel_commit || 'lineage-23.2' }}
+  PATCH_BASE: ${{ inputs.patch_base || '4238ee49a84b' }}
+
+  # Manager = BakaSU (ReSukiSU 后继). LKM 模式: CONFIG_KSU=m.
+  MANAGER_SOURCE: 'https://github.com/Baka-SU/BakaSU.git'
+  MANAGER_REF: ${{ inputs.manager_ref || 'main' }}
+
+  # SUSFS-LKM 源码（legacy 分支面向 pre-5.10；4.19 适配见 Patches/SUSFS-LKM/）
+  SUSFS_LKM_SOURCE: 'https://github.com/Hotsteel2901/susfs4ksu-lkm.git'
+  SUSFS_LKM_REF: ${{ inputs.susfs_lkm_ref || 'legacy' }}
+
+  BOOT_IMG_URL: ${{ inputs.boot_img_url || '' }}
+
+  # NoMount VFS backend，锁定已验证 commit（不跟 dev 头部，保证可复现）。
+  NOMOUNT_COMMIT: 'a159c0c225e67f180b7fb55ad78a77b0f98beb5b'
+
+  # Toolchain
+  CLANG: clang
+  CLANG_TRIPLE: aarch64-linux-gnu-
+  CROSS_COMPILE: aarch64-linux-gnu-
+  LIBCLANG_PATH: /usr/lib/llvm-18/lib
+  JOBS: '4'
+
+jobs:
+  build-lkm:
+    name: 'Build BakaSU LKM boot.img + SUSFS-LKM'
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+
+      - name: Checkout repo (patches & tools)
+        uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang-18 libclang-18-dev \
+            gcc-aarch64-linux-gnu gcc-x86-64-linux-gnu \
+            cpio zstd python3 bc bison flex libssl-dev
+          sudo ln -sf /usr/bin/clang-18 /usr/local/bin/clang
+          sudo ln -sf /usr/lib/llvm-18/lib/libclang.so.1 /usr/lib/llvm-18/lib/libclang.so
+          clang --version | head -1
+
+      - name: Setup Rust (for ksud / ksuinit)
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup target add aarch64-unknown-linux-musl
+          rustc --version
+
+      - name: Clone kernel (latest by default)
+        run: |
+          git clone --depth=1 --single-branch -b "$KERNEL_BRANCH" "$KERNEL_SOURCE" device_kernel
+          cd device_kernel
+          if git cat-file -e "$KERNEL_REF^{commit}" 2>/dev/null; then
+            git checkout -q "$KERNEL_REF"
+          else
+            git fetch -q --depth=1 origin "$KERNEL_REF"
+            git checkout -q "$KERNEL_REF"
+          fi
+          echo "kernel HEAD: $(git rev-parse HEAD)"
+
+      - name: Clone BakaSU (manager)
+        run: |
+          git clone --depth=1 --single-branch -b "$MANAGER_REF" "$MANAGER_SOURCE" bakasu
+          cd bakasu
+          echo "manager HEAD: $(git rev-parse HEAD)"
+          echo "KSU_VERSION: $(grep -oP 'KSU_VERSION :=.*' kernel/Kbuild | head -1)"
+
+      - name: Clone SUSFS-LKM + apply 4.19 adaptation patches
+        run: |
+          git clone --depth=1 --single-branch -b "$SUSFS_LKM_REF" "$SUSFS_LKM_SOURCE" susfs_lkm
+          cd susfs_lkm
+          echo "SUSFS-LKM HEAD: $(git rev-parse HEAD) ($SUSFS_LKM_REF)"
+          # 4.19 适配补丁（按名字排序应用；目录内 README.md 说明适配地图）
+          shopt -s nullglob
+          for p in "$GITHUB_WORKSPACE"/Patches/SUSFS-LKM/*.patch; do
+            echo "[+] applying $(basename "$p")"
+            patch -p1 < "$p" || { echo "::error::$(basename "$p") failed to apply"; exit 1; }
+          done
+          if [ -n "$(find . -name '*.rej')" ]; then
+            echo "::error::SUSFS-LKM patches left .rej files:"; find . -name '*.rej'; exit 1
+          fi
+
+      - name: Validate VFS backend selection (mutually exclusive)
+        run: |
+          # Hybrid Mount 与 NoMount 互斥：都劫持同一层 VFS (inode_operations /
+          # file_operations / dentry_operations)，且各自使用独立不兼容的 keyring
+          # 协议（HybridMount 用 "hm1"，NoMount 用 "NOMOUNT"）。二者同源
+          # （HybridMount 的 vfs 子系统 fork 自 NoMount），同一内核里两套驱动
+          # 会互抢 hook。默认两个都关；开两个直接 fail。
+          HM="${{ inputs.vfs_hybridmount }}"
+          NM="${{ inputs.vfs_nomount }}"
+          HM="${HM:-false}"
+          NM="${NM:-false}"
+
+          COUNT=0
+          [ "$HM" = "true" ] && COUNT=$((COUNT + 1))
+          [ "$NM" = "true" ] && COUNT=$((COUNT + 1))
+
+          echo "VFS backend selection:"
+          echo "  VFS_HYBRIDMOUNT = $HM"
+          echo "  VFS_NOMOUNT     = $NM"
+
+          if [ "$COUNT" -gt 1 ]; then
+            echo ""
+            echo "[-] ERROR: VFS backends are mutually exclusive, but $COUNT are enabled."
+            echo "[-] Hybrid Mount and NoMount hijack the same VFS layer and use"
+            echo "[-] incompatible keyring protocols. Enable at most ONE of them."
+            exit 1
+          fi
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "[i] No VFS backend selected - building without path redirection."
+            VFS_LABEL=""
+          else
+            echo "[+] VFS backend check passed."
+            if [ "$HM" = "true" ]; then VFS_LABEL="hybridmount"; fi
+            if [ "$NM" = "true" ]; then VFS_LABEL="nomount"; fi
+          fi
+
+          if [ -n "$VFS_LABEL" ]; then
+            echo "VFS_LABEL=-$VFS_LABEL" >> $GITHUB_ENV
+          else
+            echo "VFS_LABEL=" >> $GITHUB_ENV
+          fi
+          echo "[+] Artifact suffix will be: '${VFS_LABEL:-(none)}'"
+
+      - name: Patch kernel - ReKernel-X + DroidSpaces (auto-fallback to verified base)
+        run: |
+          cd device_kernel
+          apply_patches() {
+            patch -p1 < "$GITHUB_WORKSPACE/Patches/RekernelX/rkx-4.19.patch" && \
+            patch -p1 < "$GITHUB_WORKSPACE/Patches/Droidspaces/cgroup.patch"
+          }
+          if apply_patches; then
+            echo "[+] RKX/DS patches applied on $(git rev-parse HEAD) (latest)"
+          else
+            echo "[!] patches failed on latest, resetting and falling back to verified base $PATCH_BASE"
+            git checkout -f -q . ; git clean -fd -q ; git reset -q --hard
+            git fetch -q --depth=1 origin "$PATCH_BASE"
+            git checkout -q "$PATCH_BASE"
+            apply_patches || { echo "::error::patches also failed on $PATCH_BASE"; exit 1; }
+            echo "[+] RKX/DS patches applied on $PATCH_BASE (verified base)"
+          fi
+          grep -q "rekernel_x" drivers/Makefile || printf "\nobj-\$(CONFIG_REKERNEL_X) += rekernel_x/\n" >> drivers/Makefile
+          grep -q 'rekernel_x' drivers/Kconfig || sed -i "/endmenu/i\source \"drivers/rekernel_x/Kconfig\"" drivers/Kconfig
+          echo "-g$(git rev-parse --short HEAD)-hotsteel-BakaSU-LKM" > .scmversion
+          echo "[+] scmversion: $(cat .scmversion)"
+
+      - name: DroidSpaces cgroup prefix fix check
+        run: |
+          cd device_kernel
+          if grep -qF 'cft->ss && (cgrp->root->flags & CGRP_ROOT_NOPREFIX)' kernel/cgroup/cgroup.c; then
+            echo "[+] cgroup file-prefix handling present (DroidSpaces patch applied)."
+          else
+            echo "[-] cgroup file-prefix handling missing!"
+            false
+          fi
+
+      - name: Patch HybridMount VFS Subsystem
+        if: inputs.vfs_hybridmount == true
+        run: |
+          cd device_kernel
+          # 顺序约束：必须排在 ReKernel-X 步骤之后（那条 fallback 会 git clean -fd）。
+          # 4.19 属 legacy (>=5.10 才有预编译 .ko)，必须 built-in (=y)。
+          cp "$GITHUB_WORKSPACE/Patches/HybridMount/hybridmount_patch_to_4.19.patch" ./
+          patch -p1 < hybridmount_patch_to_4.19.patch
+          rm -f hybridmount_patch_to_4.19.patch
+          find . -name "*.orig" -delete
+          if [ -n "$(find . -name '*.rej')" ]; then
+            echo "[-] hybridmount_patch has rejected hunks:"; find . -name "*.rej"; false
+          fi
+          test -f fs/hybridmount/hybridmount.c || { echo "[-] fs/hybridmount/hybridmount.c missing"; false; }
+          grep -qF 'obj-$(CONFIG_HYBRIDMOUNT) += hybridmount/' fs/Makefile || { echo "[-] fs/Makefile not wired"; false; }
+          grep -qF 'source "fs/hybridmount/Kconfig"' fs/Kconfig || { echo "[-] fs/Kconfig not wired"; false; }
+          echo "[+] Hybrid Mount VFS subsystem patched (built-in)."
+
+      - name: Patch NoMount VFS Subsystem
+        if: inputs.vfs_nomount == true
+        run: |
+          cd device_kernel
+          # 同上：必须排在 ReKernel-X 步骤之后。
+          # 显式传固定 commit（env.NOMOUNT_COMMIT）而不是跟 dev 头部。
+          curl -sSL "https://raw.githubusercontent.com/maxsteeel/nomount/${NOMOUNT_COMMIT}/kernel/setup.sh" | bash -s "$NOMOUNT_COMMIT"
+          find . -name "*.orig" -delete
+          test -d fs/nomount || { echo "[-] fs/nomount missing (symlink not created)"; false; }
+          test -f fs/nomount/nomount.c || { echo "[-] fs/nomount/nomount.c missing"; false; }
+          grep -q "nomount" fs/Makefile || { echo "[-] fs/Makefile not wired"; false; }
+          grep -q "fs/nomount/Kconfig" fs/Kconfig || { echo "[-] fs/Kconfig not wired"; false; }
+          echo "[+] NoMount VFS subsystem patched (built-in, commit ${NOMOUNT_COMMIT})."
+
+      - name: Generate kernel config (defconfig + oplus + droidspaces, no LTO/CFI, kprobes on)
+        run: |
+          cd device_kernel
+          export OUT="$PWD/out"
+          mkdir -p "$OUT"
+          # CC=clang MUST be a command-line make arg (Makefile overrides env CC)
+          make O="$OUT" CC=clang ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- vendor/kona-perf_defconfig
+          MAKEFLAGS="CC=clang ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu-" \
+            scripts/kconfig/merge_config.sh -m -O "$OUT" "$OUT/.config" \
+              arch/arm64/configs/vendor/oplus.config \
+              "$GITHUB_WORKSPACE/Patches/Droidspaces/droidspaces.config"
+          # 关 LTO/CFI（CFI 内核不能加载非 CFI 的 ksu.ko / SUSFS-LKM）；
+          # 开 ReKernel-X；开 KPROBES/KRETPROBES + syscall tracepoints：
+          #   - BakaSU LKM 的 syscall hook（hook/syscall_hook_manager.c）依赖 KRETPROBES
+          #     与 syscall tracepoints
+          #   - SUSFS-LKM 的 dirent 过滤与符号自举依赖 KPROBES/KRETPROBES
+          ./scripts/config --file "$OUT/.config" \
+            -e LTO_NONE -d LTO_CLANG -d THINLTO -d CFI_CLANG -d CFI_CLANG_SHADOW \
+            -e REKERNEL_X \
+            -e KPROBES -e KRETPROBES -e FTRACE -e FTRACE_SYSCALLS -e TRACEPOINTS
+
+          case "$VFS_LABEL" in
+            -hybridmount)
+              echo "CONFIG_KEYS=y" >> "$OUT/.config"
+              echo "CONFIG_ASSOCIATIVE_ARRAY=y" >> "$OUT/.config"
+              echo "CONFIG_HYBRIDMOUNT=y" >> "$OUT/.config"
+              ;;
+            -nomount)
+              echo "CONFIG_KEYS=y" >> "$OUT/.config"
+              echo "CONFIG_ASSOCIATIVE_ARRAY=y" >> "$OUT/.config"
+              echo "CONFIG_NOMOUNT=y" >> "$OUT/.config"
+              ;;
+            *)
+              echo "[i] No VFS backend requested - skipping VFS CONFIG entries."
+              ;;
+          esac
+
+          make O="$OUT" CC=clang ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+          echo "=== key config after olddefconfig ==="
+          grep -E "^CONFIG_KSU=|^CONFIG_LTO|^CONFIG_CFI|^CONFIG_MODULES=|^CONFIG_KPROBES=|^CONFIG_KRETPROBES=|^CONFIG_FTRACE_SYSCALLS=|^CONFIG_REKERNEL_X=" "$OUT/.config" || true
+
+          for k in CONFIG_KPROBES CONFIG_KRETPROBES; do
+            grep -qE "^${k}=y" "$OUT/.config" || { echo "[-] ${k} not enabled (required by BakaSU LKM / SUSFS-LKM)"; false; }
+          done
+
+          case "$VFS_LABEL" in
+            -hybridmount)
+              grep -qE '^CONFIG_HYBRIDMOUNT=y' "$OUT/.config" || { echo "[-] CONFIG_HYBRIDMOUNT did not stick"; false; }
+              grep -qE '^CONFIG_KEYS=y' "$OUT/.config" || { echo "[-] CONFIG_KEYS missing"; false; }
+              ;;
+            -nomount)
+              grep -qE '^CONFIG_NOMOUNT=y' "$OUT/.config" || { echo "[-] CONFIG_NOMOUNT did not stick"; false; }
+              grep -qE '^CONFIG_KEYS=y' "$OUT/.config" || { echo "[-] CONFIG_KEYS missing"; false; }
+              ;;
+          esac
+
+      - name: Prepare kernel for out-of-tree module build
+        run: |
+          cd device_kernel
+          export OUT="$PWD/out"
+          make O="$OUT" CC=clang ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- -j"$JOBS" modules_prepare
+          make O="$OUT" CC=clang ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- init/version.o
+          make O="$OUT" CC=clang ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- security/selinux/avc.o
+          ls -la "$OUT/include/generated/compile.h" "$OUT/security/selinux/flask.h"
+
+      - name: Build kernel Image (full tree — BakaSU check_symbol / SUSFS-LKM need vmlinux)
+        run: |
+          cd device_kernel
+          export OUT="$PWD/out"
+          make O="$OUT" CC=clang ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- -j"$JOBS" Image
+          ls -la "$OUT/arch/arm64/boot/Image"
+          ./scripts/extract-ikconfig "$OUT/arch/arm64/boot/Image" 2>/dev/null | grep -E "^CONFIG_LTO|^CONFIG_CFI|^CONFIG_KPROBES|^CONFIG_KRETPROBES" || true
+
+      - name: Build ksuinit (aarch64, for ramdisk injection)
+        run: |
+          cd bakasu
+          export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
+          export CARGO_PROFILE_RELEASE_LTO=false
+          cargo build --package ksuinit --target=aarch64-unknown-linux-musl --release -j"$JOBS"
+          mkdir -p userspace/ksud/bin/aarch64
+          cp target/aarch64-unknown-linux-musl/release/ksuinit userspace/ksud/bin/aarch64/ksuinit
+          file userspace/ksud/bin/aarch64/ksuinit
+
+      - name: Patch ksud (allow boot header v2) and build host ksud
+        run: |
+          cd bakasu
+          patch -p1 < "$GITHUB_WORKSPACE/Patches/ksud-v2.patch"
+          export CARGO_PROFILE_RELEASE_LTO=false
+          export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+          cargo build --package ksud --release -j"$JOBS"
+          ./target/release/ksud --version
+
+      - name: Build BakaSU LKM driver (kernelsu.ko)
+        run: |
+          cd bakasu/kernel
+          # LKM 模式：CONFIG_KSU=m。注意 BakaSU 的 Kconfig 里 KSU_MANUAL_HOOK 明确
+          # depends on KSU != m，因此 LKM 走它自己的 syscall hook 机制
+          # (hook/syscall_hook_manager.c, kretprobe + syscall tracepoints)，
+          # 内核侧需 CONFIG_KPROBES/KRETPROBES + FTRACE_SYSCALLS（已在 config 步骤开启）。
+          make -C "$GITHUB_WORKSPACE/device_kernel" O="$GITHUB_WORKSPACE/device_kernel/out" M="$PWD" \
+            CONFIG_KSU=m CONFIG_KSU_TRACEPOINT_HOOK=y \
+            CC=clang ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
+            -j"$JOBS" modules
+          ls -la kernelsu.ko
+          strings kernelsu.ko | grep -m1 '^vermagic' || true
+
+      - name: Build SUSFS-LKM (susfs_guard_lkm.ko)
+        run: |
+          cd susfs_lkm/kernel
+          # 外置构建，针对同一个已准备的内核树。SUSFS-LKM 通过运行时符号解析 +
+          # 自身 /proc 接口工作，未定义符号由 ksud 加载时从 /proc/kallsyms 解析。
+          make -C "$GITHUB_WORKSPACE/device_kernel" O="$GITHUB_WORKSPACE/device_kernel/out" M="$PWD" \
+            CC=clang ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
+            -j"$JOBS" modules || {
+              echo "::error::SUSFS-LKM build failed. See Patches/SUSFS-LKM/README.md for the 4.19 porting map;"
+              echo "::error::this target is still being adapted for 4.19 (legacy branch is unbuilt upstream)."
+              exit 1
+            }
+          ls -la susfs_guard_lkm.ko
+
+      - name: Obtain base boot.img (v2)
+        run: |
+          mkdir -p base_out
+          if [ -n "$BOOT_IMG_URL" ]; then
+            echo "[+] Downloading base boot.img from URL"
+            curl -fsSL "$BOOT_IMG_URL" -o base_out/boot.img
+          elif [ -f "base/boot.img" ]; then
+            echo "[+] Using repo base/boot.img"
+            cp base/boot.img base_out/boot.img
+          else
+            echo "::error::No base boot.img. Provide boot_img_url input or commit base/boot.img"
+            exit 1
+          fi
+          python3 "$GITHUB_WORKSPACE/tools/boot_info.py" base_out/boot.img
+
+      - name: Swap kernel + inject BakaSU LKM into boot.img
+        run: |
+          mkdir -p out_img
+          python3 "$GITHUB_WORKSPACE/tools/swap_kernel.py" \
+            base_out/boot.img \
+            device_kernel/out/arch/arm64/boot/Image \
+            out_img/swapped.img
+          bakasu/target/release/ksud boot-patch \
+            --boot out_img/swapped.img \
+            --module bakasu/kernel/kernelsu.ko \
+            --arch aarch64 \
+            --out out_img/ || {
+              echo "::warning::ksud boot-patch failed; trying backslashxx-style argument names"
+              bakasu/target/release/ksud boot-patch \
+                --bootimg out_img/swapped.img \
+                --module bakasu/kernel/kernelsu.ko \
+                --arch aarch64 \
+                --out out_img/
+            }
+          ls -la out_img/
+
+      - name: Verify final boot.img
+        run: |
+          python3 "$GITHUB_WORKSPACE/tools/boot_info.py" out_img/kernelsu_patched_*.img
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-patched-bakasu-lkm${{ env.VFS_LABEL }}
+          path: |
+            out_img/kernelsu_patched_*.img
+            bakasu/kernel/kernelsu.ko
+            susfs_lkm/kernel/susfs_guard_lkm.ko
+          if-no-files-found: error
