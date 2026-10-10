@@ -10,7 +10,7 @@ name: Build 4.19 BakaSU LKM Kernel + SUSFS-LKM (OnePlus 8 / LOS 23.2)
 #   - susfs_guard_lkm.ko（SUSFS-LKM，运行时加载）
 #
 # 参考仓库的关键机制：ksud 在加载 .ko 时会用 /proc/kallsyms 预解析未定义符号并改写
-# vermagic，所以外置模块可以用运行时解析的符号（SUSFS-LKM 正是这样设计的）。
+# vermagic，所以外置模块可以用运行时解析的符号（SUSFS-LKM 正是这样设计的）
 
 on:
   workflow_dispatch:
