@@ -98,6 +98,8 @@ Patches/
 ├── RekernelX/rkx-4.19.patch             # ReKernel-X 4.19 移植
 ├── HybridMount/hybridmount_patch_to_4.19.patch  # Hybrid Mount 4.19 移植（已更新到上游 dev）
 ├── Droidspaces/{cgroup.patch,droidspaces.config,fix_...cocci}
+├── BakaSU-419/0001-pkg_observer-pre59-fsnotify.patch  # BakaSU LKM 的 4.19 API 适配
+├── BakaSU-419/README.md                 # BakaSU 4.19 适配说明
 ├── SUSFS-LKM/README.md                  # SUSFS-LKM 的 4.19 适配地图与迭代方式（补丁迭代中）
 └── Archive/README.md
 ```

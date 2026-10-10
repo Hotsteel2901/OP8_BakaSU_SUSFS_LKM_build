@@ -129,6 +129,20 @@ jobs:
           echo "manager HEAD: $(git rev-parse HEAD)"
           echo "KSU_VERSION: $(grep -oP 'KSU_VERSION :=.*' kernel/Kbuild | head -1)"
 
+      - name: Apply BakaSU 4.19 compat patches
+        run: |
+          cd bakasu
+          # BakaSU 官方 LKM 只针对 GKI 5.10+；non-GKI 4.19 需要少量内核侧 API 适配，
+          # 见 Patches/BakaSU-419/README.md。按文件名顺序应用。
+          shopt -s nullglob
+          for p in "$GITHUB_WORKSPACE"/Patches/BakaSU-419/*.patch; do
+            echo "[+] applying $(basename "$p")"
+            patch -p1 < "$p" || { echo "::error::$(basename "$p") failed to apply"; exit 1; }
+          done
+          if [ -n "$(find . -name '*.rej')" ]; then
+            echo "::error::BakaSU compat patches left .rej files:"; find . -name '*.rej'; exit 1
+          fi
+
       - name: Clone SUSFS-LKM + apply 4.19 adaptation patches
         run: |
           git clone --depth=1 --single-branch -b "$SUSFS_LKM_REF" "$SUSFS_LKM_SOURCE" susfs_lkm
