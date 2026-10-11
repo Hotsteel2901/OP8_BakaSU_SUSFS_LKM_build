@@ -442,6 +442,25 @@ jobs:
           fi
           ls -la susfs_guard_lkm.ko
 
+      - name: Package SUSFS-LKM KernelSU module (susfs-lkm-module.zip)
+        if: inputs.susfs_enable
+        run: |
+          # SUSFS 是外置运行时模块，不会被 boot-patch 注入 boot.img。
+          # 这里把编好的 susfs_guard_lkm.ko 与模块模板打成一个 KernelSU 模块 zip，
+          # 在管理器里装一次即可开机自动 `ksud insmod`（见 susfs-module/README.md）。
+          rm -rf mod_stage
+          mkdir -p mod_stage
+          cp "$GITHUB_WORKSPACE"/susfs-module/module.prop mod_stage/
+          cp "$GITHUB_WORKSPACE"/susfs-module/post-fs-data.sh mod_stage/
+          cp "$GITHUB_WORKSPACE"/susfs-module/service.sh mod_stage/
+          cp susfs_lkm/kernel/susfs_guard_lkm.ko mod_stage/
+          chmod 755 mod_stage/*.sh
+          ko_desc=$(strings mod_stage/susfs_guard_lkm.ko | sed -n 's/^description=//p' | head -1)
+          echo "[i] susfs_guard_lkm.ko modinfo: ${ko_desc:-<none>}"
+          rm -f susfs-lkm-module.zip
+          ( cd mod_stage && zip -r9 "$GITHUB_WORKSPACE/susfs-lkm-module.zip" . )
+          unzip -l "$GITHUB_WORKSPACE/susfs-lkm-module.zip"
+
       - name: Obtain base boot.img (v2)
         run: |
           mkdir -p base_out
@@ -484,4 +503,5 @@ jobs:
             out_img/kernelsu_patched_*.img
             bakasu/kernel/kernelsu.ko
             susfs_lkm/kernel/susfs_guard_lkm.ko
+            susfs-lkm-module.zip
           if-no-files-found: error
