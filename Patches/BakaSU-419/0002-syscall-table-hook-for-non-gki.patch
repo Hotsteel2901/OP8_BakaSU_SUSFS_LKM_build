@@ -1,0 +1,300 @@
+diff --git a/kernel/Kconfig b/kernel/Kconfig
+index 79bc79ee..7cb3a654 100644
+--- a/kernel/Kconfig
++++ b/kernel/Kconfig
+@@ -112,6 +112,20 @@ config KSU_SUSFS
+ 
+ endchoice
+ 
++config KSU_SYSCALL_TABLE_HOOK
++	bool "Use direct sys_call_table patching for the Syscall Redirect hook"
++	depends on KSU_TRACEPOINT_HOOK
++	help
++	  Only meaningful together with the "Tracepoint Syscall Redirect" hook.
++	  When enabled, the syscall hook overwrites the sys_call_table entries
++	  directly (dispatching by syscall number and running the original syscall
++	  through a shadow copy of the table) instead of redirecting through the
++	  GKI sys_enter tracepoint.
++
++	  The tracepoint based redirection is only available on GKI 2.0 kernels,
++	  while direct sys_call_table patching also works on non-GKI kernels
++	  (verified on 4.19). Use this for KernelSU LKM on non-GKI kernels.
++
+ menu "KernelSU - Manual Hook Auto hook"
+     depends on KSU_MANUAL_HOOK
+ 
+diff --git a/kernel/hook/arm64/syscall_hook.c b/kernel/hook/arm64/syscall_hook.c
+index 5f5b32c6..5674e2d8 100644
+--- a/kernel/hook/arm64/syscall_hook.c
++++ b/kernel/hook/arm64/syscall_hook.c
+@@ -4,13 +4,24 @@
+ 
+ #include <linux/kallsyms.h>
+ #include <linux/mutex.h>
++#include <linux/slab.h>
++#include <linux/string.h>
+ #include <asm/cacheflush.h>
+ #include "infra/symbol_resolver.h"
+ #include "../patch_memory.h"
+ #include "arch.h"
+ #include "klog.h" // IWYU pragma: keep
+ 
++/* Handlers run the original syscall with ksu_syscall_table[orig_nr](regs).
++ * With CONFIG_KSU_SYSCALL_TABLE_HOOK this points at a shadow copy that keeps
++ * the ORIGINAL handlers, while the real sys_call_table entries are patched to
++ * our dispatcher. Without it, it simply aliases the real sys_call_table. */
+ syscall_fn_t *ksu_syscall_table = NULL;
++
++/* The real sys_call_table resolved from the kernel. All text patching is done
++ * against this table, never against the (possibly shadowed) ksu_syscall_table. */
++static syscall_fn_t *ksu_real_syscall_table = NULL;
++
+ int ksu_dispatcher_nr = -1;
+ 
+ // Hook registration table — read with READ_ONCE from tracepoint/dispatcher
+@@ -30,15 +41,15 @@ static int hooked_count = 0;
+ 
+ static int patch_syscall_table(int nr, syscall_fn_t fn)
+ {
+-    if (ksu_syscall_table == NULL)
++    if (ksu_real_syscall_table == NULL)
+         return -ENOENT;
+     if (nr < 0 || nr >= __NR_syscalls)
+         return -EINVAL;
+ 
+-    pr_info("patch syscall %d, 0x%lx -> 0x%lx\n", nr, (unsigned long)READ_ONCE(ksu_syscall_table[nr]),
++    pr_info("patch syscall %d, 0x%lx -> 0x%lx\n", nr, (unsigned long)READ_ONCE(ksu_real_syscall_table[nr]),
+             (unsigned long)fn);
+ 
+-    if (ksu_patch_text(&ksu_syscall_table[nr], &fn, sizeof(fn), KSU_PATCH_TEXT_FLUSH_DCACHE)) {
++    if (ksu_patch_text(&ksu_real_syscall_table[nr], &fn, sizeof(fn), KSU_PATCH_TEXT_FLUSH_DCACHE)) {
+         pr_err("patch syscall %d failed\n", nr);
+         return -EIO;
+     }
+@@ -50,7 +61,7 @@ static int patch_syscall_table(int nr, syscall_fn_t fn)
+ // save original to *old, and record for restoration at module exit.
+ void ksu_syscall_table_hook(int nr, syscall_fn_t fn, syscall_fn_t *old)
+ {
+-    if (ksu_syscall_table == NULL)
++    if (ksu_real_syscall_table == NULL)
+         return;
+     if (nr < 0 || nr >= __NR_syscalls) {
+         pr_info("invalid nr: %d\n", nr);
+@@ -59,7 +70,7 @@ void ksu_syscall_table_hook(int nr, syscall_fn_t fn, syscall_fn_t *old)
+ 
+     mutex_lock(&hooked_entries_lock);
+ 
+-    syscall_fn_t orig = READ_ONCE(ksu_syscall_table[nr]);
++    syscall_fn_t orig = READ_ONCE(ksu_real_syscall_table[nr]);
+     if (old)
+         *old = orig;
+ 
+@@ -92,7 +103,7 @@ void ksu_syscall_table_unhook(int nr)
+ {
+     int i;
+ 
+-    if (ksu_syscall_table == NULL)
++    if (ksu_real_syscall_table == NULL)
+         return;
+     if (nr < 0 || nr >= __NR_syscalls)
+         return;
+@@ -165,6 +176,29 @@ static long __nocfi ksu_syscall_dispatcher(const struct pt_regs *regs)
+     return -ENOSYS;
+ }
+ 
++#ifdef CONFIG_KSU_SYSCALL_TABLE_HOOK
++// Direct sys_call_table dispatcher.
++//
++// The real sys_call_table[@nr] entry is overwritten with this function, so the
++// kernel invokes it straight for the hooked syscall. regs->syscallno is the
++// current syscall number (arm64 sets it in el0_svc_common before invoking the
++// handler), which lets us route to the right hook. The hook then runs the
++// original syscall through the shadow table (ksu_syscall_table).
++static long __nocfi ksu_syscall_dispatcher_direct(const struct pt_regs *regs)
++{
++    int nr = regs->syscallno;
++
++    if (likely(nr >= 0 && nr < __NR_syscalls)) {
++        ksu_syscall_hook_fn fn = READ_ONCE(syscall_hooks[nr]);
++        if (likely(fn))
++            return fn(nr, regs);
++    }
++
++    pr_warn_ratelimited("syscall table hook: unexpected syscall nr=%d\n", nr);
++    return -ENOSYS;
++}
++#endif
++
+ // Register a handler into the dispatcher's routing table.
+ // Does not modify the syscall table — the dispatcher slot is shared by all hooks.
+ int ksu_register_syscall_hook(int nr, ksu_syscall_hook_fn fn)
+@@ -176,6 +210,11 @@ int ksu_register_syscall_hook(int nr, ksu_syscall_hook_fn fn)
+         return -EEXIST;
+     }
+     WRITE_ONCE(syscall_hooks[nr], fn);
++#ifdef CONFIG_KSU_SYSCALL_TABLE_HOOK
++    // Point the real syscall table entry straight at our dispatcher.
++    // ksu_syscall_table_hook() records the original for restoration on exit.
++    ksu_syscall_table_hook(nr, (syscall_fn_t)ksu_syscall_dispatcher_direct, NULL);
++#endif
+     pr_info("registered syscall hook for nr=%d\n", nr);
+     return 0;
+ }
+@@ -186,6 +225,10 @@ void ksu_unregister_syscall_hook(int nr)
+ {
+     if (nr < 0 || nr >= __NR_syscalls)
+         return;
++#ifdef CONFIG_KSU_SYSCALL_TABLE_HOOK
++    // Restore the real syscall table entry to the original handler.
++    ksu_syscall_table_unhook(nr);
++#endif
+     WRITE_ONCE(syscall_hooks[nr], NULL);
+     pr_info("unregistered syscall hook for nr=%d\n", nr);
+ }
+@@ -199,16 +242,32 @@ bool ksu_has_syscall_hook(int nr)
+ 
+ void __init ksu_syscall_hook_init(void)
+ {
+-    int ni_slot;
+-
+     memset(syscall_hooks, 0, sizeof(syscall_hooks));
+ 
+-    ksu_syscall_table = (syscall_fn_t *)ksu_resolve_symbol_for_functable_hook("sys_call_table");
+-    pr_info("sys_call_table=0x%lx", (unsigned long)ksu_syscall_table);
++    ksu_real_syscall_table = (syscall_fn_t *)ksu_resolve_symbol_for_functable_hook("sys_call_table");
++    pr_info("sys_call_table=0x%lx", (unsigned long)ksu_real_syscall_table);
+ 
+-    if (!ksu_syscall_table)
++    if (!ksu_real_syscall_table)
+         return;
+ 
++#ifdef CONFIG_KSU_SYSCALL_TABLE_HOOK
++    // Keep a shadow copy of the original handlers so our hooks can still run the
++    // real syscall (via ksu_syscall_table[orig_nr]) while the real
++    // sys_call_table[nr] entry points at the dispatcher.
++    ksu_syscall_table = kzalloc(__NR_syscalls * sizeof(syscall_fn_t), GFP_KERNEL);
++    if (!ksu_syscall_table) {
++        pr_err("sys_call_table hook: failed to allocate shadow table\n");
++        ksu_syscall_table = ksu_real_syscall_table;
++        return;
++    }
++    memcpy(ksu_syscall_table, ksu_real_syscall_table, __NR_syscalls * sizeof(syscall_fn_t));
++    ksu_dispatcher_nr = -1;
++    pr_info("sys_call_table hook: shadow table 0x%lx installed\n", (unsigned long)ksu_syscall_table);
++#else
++    int ni_slot;
++
++    ksu_syscall_table = ksu_real_syscall_table;
++
+     // Find one ni_syscall slot for the dispatcher
+     if (ksu_find_ni_syscall_slots(&ni_slot, 1) < 1) {
+         pr_err("failed to find ni_syscall slot for dispatcher\n");
+@@ -218,13 +277,14 @@ void __init ksu_syscall_hook_init(void)
+     ksu_dispatcher_nr = ni_slot;
+     ksu_syscall_table_hook(ksu_dispatcher_nr, (syscall_fn_t)ksu_syscall_dispatcher, NULL);
+     pr_info("dispatcher installed at slot %d\n", ksu_dispatcher_nr);
++#endif
+ }
+ 
+ void __exit ksu_syscall_hook_exit(void)
+ {
+     int i;
+ 
+-    if (!ksu_syscall_table)
++    if (!ksu_real_syscall_table)
+         goto clear_state;
+ 
+     // First, restore all patched syscall table entries while the dispatcher
+@@ -235,7 +295,7 @@ void __exit ksu_syscall_hook_exit(void)
+         syscall_fn_t orig = hooked_entries[i].orig;
+ 
+         pr_info("restore syscall %d to 0x%lx\n", nr, (unsigned long)orig);
+-        if (ksu_patch_text(&ksu_syscall_table[nr], &orig, sizeof(orig), KSU_PATCH_TEXT_FLUSH_DCACHE)) {
++        if (ksu_patch_text(&ksu_real_syscall_table[nr], &orig, sizeof(orig), KSU_PATCH_TEXT_FLUSH_DCACHE)) {
+             pr_err("restore syscall %d failed\n", nr);
+         }
+     }
+@@ -250,6 +310,14 @@ clear_state:
+     memset(syscall_hooks, 0, sizeof(syscall_hooks));
+     ksu_dispatcher_nr = -1;
+ 
++#ifdef CONFIG_KSU_SYSCALL_TABLE_HOOK
++    // Drop the shadow table. After the real table is restored, any stray call
++    // simply falls back to the (restored) real sys_call_table.
++    if (ksu_syscall_table && ksu_syscall_table != ksu_real_syscall_table)
++        kfree(ksu_syscall_table);
++    ksu_syscall_table = ksu_real_syscall_table;
++#endif
++
+     pr_info("all syscall hooks restored\n");
+ }
+ 
+diff --git a/kernel/hook/syscall_hook_manager.c b/kernel/hook/syscall_hook_manager.c
+index 30c23726..5aa49065 100644
+--- a/kernel/hook/syscall_hook_manager.c
++++ b/kernel/hook/syscall_hook_manager.c
+@@ -132,10 +132,14 @@ void __init ksu_syscall_hook_manager_init(void)
+     int ret;
+     pr_info("hook_manager: ksu_hook_manager_init called\n");
+ 
++#ifndef CONFIG_KSU_SYSCALL_TABLE_HOOK
+ #ifdef CONFIG_KRETPROBES
+     syscall_regfunc_rp = init_kretprobe("syscall_regfunc", syscall_regfunc_handler);
+     syscall_unregfunc_rp = init_kretprobe("syscall_unregfunc", syscall_unregfunc_handler);
+ #endif
++#else
++    (void)ret;
++#endif
+ 
+     // Register syscall hooks via dispatcher
+     ksu_register_syscall_hook(__NR_setresuid, ksu_hook_setresuid);
+@@ -144,6 +148,7 @@ void __init ksu_syscall_hook_manager_init(void)
+     ksu_register_syscall_hook(__NR_newfstatat, ksu_hook_newfstatat);
+     ksu_register_syscall_hook(__NR_faccessat, ksu_hook_faccessat);
+ 
++#ifndef CONFIG_KSU_SYSCALL_TABLE_HOOK
+ #ifdef CONFIG_HAVE_SYSCALL_TRACEPOINTS
+     ret = register_trace_prio_sys_enter(ksu_sys_enter_handler, NULL, INT_MIN);
+ #ifndef CONFIG_KRETPROBES
+@@ -155,6 +160,12 @@ void __init ksu_syscall_hook_manager_init(void)
+         pr_info("hook_manager: sys_enter tracepoint registered\n");
+     }
+ #endif
++#else
++    // CONFIG_KSU_SYSCALL_TABLE_HOOK: sucompat is provided by directly patching
++    // sys_call_table (see ksu_register_syscall_hook), so no GKI syscall
++    // tracepoints and no kretprobe-based process marking are needed here.
++    pr_info("hook_manager: using direct sys_call_table hook (no tracepoint)\n");
++#endif
+ 
+     ksu_setuid_hook_init();
+     ksu_sucompat_init();
+@@ -163,6 +174,7 @@ void __init ksu_syscall_hook_manager_init(void)
+ void __exit ksu_syscall_hook_manager_exit(void)
+ {
+     pr_info("hook_manager: ksu_hook_manager_exit called\n");
++#ifndef CONFIG_KSU_SYSCALL_TABLE_HOOK
+ #ifdef CONFIG_HAVE_SYSCALL_TRACEPOINTS
+     unregister_trace_sys_enter(ksu_sys_enter_handler, NULL);
+     tracepoint_synchronize_unregister();
+@@ -172,6 +184,7 @@ void __exit ksu_syscall_hook_manager_exit(void)
+ #ifdef CONFIG_KRETPROBES
+     destroy_kretprobe(&syscall_regfunc_rp);
+     destroy_kretprobe(&syscall_unregfunc_rp);
++#endif
+ #endif
+ 
+     ksu_unregister_syscall_hook(__NR_setresuid);
+diff --git a/kernel/tools/ddk_compatible.mk b/kernel/tools/ddk_compatible.mk
+index 4205be23..3219c550 100644
+--- a/kernel/tools/ddk_compatible.mk
++++ b/kernel/tools/ddk_compatible.mk
+@@ -27,4 +27,8 @@ ifeq ($(CONFIG_KSU_TRACEPOINT_HOOK),y)
+ ccflags-y += -DCONFIG_KSU_TRACEPOINT_HOOK
+ endif
+ 
++ifeq ($(CONFIG_KSU_SYSCALL_TABLE_HOOK),y)
++ccflags-y += -DCONFIG_KSU_SYSCALL_TABLE_HOOK
++endif
++
+ CONFIG_KSU_FULL_NAME_FORMAT := "%TAG_NAME%-%COMMIT_SHA%@%REPO_NAME%"

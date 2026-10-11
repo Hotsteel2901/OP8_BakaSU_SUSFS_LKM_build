@@ -25,8 +25,40 @@ BakaSU 的 `CONFIG_KSU=m`（LKM）+ `CONFIG_KSU_TRACEPOINT_HOOK=y` 是允许的�
 
 > 参考：backslashxx/KernelSU（已验证可在 4.19 跑 LKM）在旧内核上**不用 fsnotify**，
 > 改用 LSM `inode_rename`（`hook/lsm_hooks.c`），并在 `kernel_compat.h` 里 `#define TWA_RESUME 1`。
-> BakaSU 的 `hook/lsm_hooks.c` 只在**非** tracepoint 路径编译，而 LKM 的 syscall hook 必须走
-> tracepoint，所以这里选择把 fsnotify 版本适配到 4.19，而不是切换实现。
+> BakaSU 的 `hook/lsm_hooks.c` 只在**非** syscall-hook 路径编译，所以这里选择把 fsnotify
+> 版本适配到 4.19，而不是切换实现。
+
+## 0002 — 直接改写 sys_call_table 的 syscall hook（摆脱 tracepoint 依赖）
+
+BakaSU 的 syscall hook（`CONFIG_KSU_TRACEPOINT_HOOK`）用 GKI 的 `sys_enter` tracepoint
+把被 hook 的 syscall 重定向到 `ksu_dispatcher_nr` 槽位的统一 dispatcher。这套重定向在
+**non-GKI 4.19** 上不可靠（tracepoint 重定向本身是 GKI 2.0 的特性），是刷入后黑屏/回
+Recovery 的根因之一。
+
+补丁新增 `CONFIG_KSU_SYSCALL_TABLE_HOOK`（作为 `CONFIG_KSU_TRACEPOINT_HOOK` 的**实现
+修饰项**，工作流里两个都开），把实现换成「直接改写 `sys_call_table`」：
+
+* `kernel/hook/arm64/syscall_hook.c`
+  - 新增 `ksu_real_syscall_table`（真实表，所有文本改写只对它做）；
+  - direct 模式下 `ksu_syscall_table` 指向一份**影子表**（保留原始 handler），
+    这样 handler 里的 `ksu_syscall_table[orig_nr](regs)` 仍能调用**原 syscall**，
+    而真实表里该槽位已被指向我们的 dispatcher；
+  - 新增 `ksu_syscall_dispatcher_direct()`：arm64 在 `el0_svc_common()` 里调用前会设置
+    `regs->syscallno = scno`，因此按 `syscallno` 路由即可（不需要 tracepoint 的 x8 传参）；
+  - `ksu_register_syscall_hook()` / `ksu_unregister_syscall_hook()` 在 direct 模式下改为对
+    真实表 `ksu_syscall_table_hook()`/`unhook()`（复用已有的记录/恢复逻辑）。
+* `kernel/hook/syscall_hook_manager.c`
+  - direct 模式下跳过 `syscall_regfunc/unregfunc` kretprobe 与 `sys_enter` tracepoint 的
+    注册/注销；其余（`ksu_setuid_hook_init`、`ksu_sucompat_init`、注册 5 个 handler）不变。
+* `kernel/Kconfig` / `kernel/tools/ddk_compatible.mk`
+  - 新增开关，并让外置模块构建把它翻成 `-DCONFIG_KSU_SYSCALL_TABLE_HOOK`。
+
+被 hook 的 syscall：`execve`、`execveat`、`newfstatat`、`faccessat`、`setresuid`（与
+tracepoint 路径完全一致），handler（`hook/syscall_event_bridge.c`、`feature/sucompat.c`）
+无需改动。
+
+工作流对 `bakasu` 的 LKM 构建参数改为
+`CONFIG_KSU=m CONFIG_KSU_TRACEPOINT_HOOK=y CONFIG_KSU_SYSCALL_TABLE_HOOK=y`。
 
 ## 迭代说明
 

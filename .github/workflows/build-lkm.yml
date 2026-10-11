@@ -294,9 +294,12 @@ jobs:
               arch/arm64/configs/vendor/oplus.config \
               "$GITHUB_WORKSPACE/Patches/Droidspaces/droidspaces.config"
           # 关 LTO/CFI（CFI 内核不能加载非 CFI 的 ksu.ko / SUSFS-LKM）；
-          # 开 ReKernel-X；开 KPROBES/KRETPROBES + syscall tracepoints：
-          #   - BakaSU LKM 的 syscall hook（hook/syscall_hook_manager.c）依赖 KRETPROBES
-          #     与 syscall tracepoints
+          # 开 ReKernel-X；开 KPROBES/KRETPROBES（SUSFS-LKM 的 dirent 过滤与符号
+          # 自举依赖它们）：
+          #   - BakaSU LKM 的 syscall hook 改走「直接改写 sys_call_table」实现
+          #     （CONFIG_KSU_SYSCALL_TABLE_HOOK=y，见 Patches/BakaSU-419/0002），
+          #     不再依赖 GKI 的 sys_enter tracepoint（non-GKI 4.19 上不可用），
+          #     因此这里保留 FTRACE/TRACEPOINTS 仅为兼容/日志用途。
           #   - SUSFS-LKM 的 dirent 过滤与符号自举依赖 KPROBES/KRETPROBES
           ./scripts/config --file "$OUT/.config" \
             -e LTO_NONE -d LTO_CLANG -d THINLTO -d CFI_CLANG -d CFI_CLANG_SHADOW \
@@ -398,13 +401,14 @@ jobs:
       - name: Build BakaSU LKM driver (kernelsu.ko)
         run: |
           cd bakasu/kernel
-          # LKM 模式：CONFIG_KSU=m。注意 BakaSU 的 Kconfig 里 KSU_MANUAL_HOOK 明确
-          # depends on KSU != m，因此 LKM 走它自己的 syscall hook 机制
-          # (hook/syscall_hook_manager.c, kretprobe + syscall tracepoints)，
-          # 内核侧需 CONFIG_KPROBES/KRETPROBES + FTRACE_SYSCALLS（已在 config 步骤开启）。
+          # LKM 模式：CONFIG_KSU=m。BakaSU 的 Kconfig 里 KSU_MANUAL_HOOK 明确
+          # depends on KSU != m，因此 LKM 走 syscall hook。其默认实现靠 GKI 的
+          # sys_enter tracepoint 重定向，在 non-GKI 4.19 上不可用，所以额外开
+          # CONFIG_KSU_SYSCALL_TABLE_HOOK=y（Patches/BakaSU-419/0002）：直接改写
+          # sys_call_table，按 syscall 号分发，原 syscall 走影子表。
           set +e; set -o pipefail
           make -C "$GITHUB_WORKSPACE/device_kernel" O="$GITHUB_WORKSPACE/device_kernel/out" M="$PWD" \
-            CONFIG_KSU=m CONFIG_KSU_TRACEPOINT_HOOK=y \
+            CONFIG_KSU=m CONFIG_KSU_TRACEPOINT_HOOK=y CONFIG_KSU_SYSCALL_TABLE_HOOK=y \
             CC=clang ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
             -j"$JOBS" modules 2>&1 | tee /tmp/ksu_build.log
           rc=${PIPESTATUS[0]}
