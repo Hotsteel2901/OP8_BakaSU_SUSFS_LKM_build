@@ -72,7 +72,8 @@ SUSFS 可以独立升级、不依赖 in-tree SUSFS 补丁（也绕开上游 Baka
 
 | 补丁 | 解决问题 |
 |---|---|
-| `0001-susfs_h-regs_set_return_value-pre55.patch` | 4.19 arm64 没有 `regs_set_return_value()`（`sus_map.c`/`sus_path.c`/`susfs_hide_syms.c` 用到）→ 在 `susfs.h` 加 `< 5.5` 的 arm64 内联实现（`regs->regs[0] = val`）；并在同一处补 `< 5.7` 的 `TWA_RESUME`（`susfs_supercall.c` 用 `task_work_add(..., TWA_RESUME)`，4.19 是 `bool notify`）。 |
+| `0001-susfs_h-...` | `susfs.h` 集中补三处 `<5.10/5.5/5.7` 兼容：`regs_set_return_value()`（4.19 arm64 无，`sus_map`/`sus_path`/`susfs_hide_syms` 用），`TWA_RESUME`（`susfs_supercall.c` 的 `task_work_add`），`regs_get_kernel_argument()`（`sus_path.c`/`susfs_hide_syms.c` 用，4.19 无）。 |
+| `0004-sus_mount-419-mount-layout-and-statx.patch` | `sus_mount.c` 的 `fs/mount.h` 布局与 statx 差异：4.19 的 `struct mnt_namespace` **无 `ns_lock`**、无 `MNT_CURSOR`（`ns->list` 仍在）→ 新增 `< 5.7` 子分支（用 no-op 锁宏 + 去掉 cursor 判定，并把两处 `spin_lock(&ns->ns_lock)` 换成 `SUS_MOUNT_NS_LOCK(ns)`）；`struct statx` **无 `stx_mnt_id`**（5.8+）→ 门控掉 statx 的 mnt_id 改写。 |
 | `0002-sus_path-drop-path_notify-pre52.patch` | `path_notify` 是 5.2+ 的 LSM hook，4.19 的 `security_hook_heads`/`security_list_options` 没有该成员。按 `>= 5.2` 门控掉该 hook（前向声明、静态断言、hook 结构体、处理函数、注册/注销列表项），4.19 上不安装它。 |
 | `0003-susfs_kstat-syscall_get_arguments-5args.patch` | 本 4.19 树的 arm64 `syscall_get_arguments` 是 **5 参**形式 `(task, regs, i, n, args)`，而源码用的是 3 参。改为 `(current, regs, 0, 6, args)`。 |
 

@@ -1,22 +1,22 @@
 diff --git a/kernel/susfs.h b/kernel/susfs.h
-index 69e4605..46d7490 100644
+index 69e4605..9dc28a5 100644
 --- a/kernel/susfs.h
 +++ b/kernel/susfs.h
 @@ -6,6 +6,7 @@
  #include <linux/err.h>	/* IS_ERR */
  #include <linux/mm.h>	/* PAGE_SIZE */
  #include <linux/version.h>	/* LINUX_VERSION_CODE for the pre-5.10 shims below */
-+#include <asm/ptrace.h>		/* struct pt_regs, for the regs_set_return_value shim */
++#include <asm/ptrace.h>		/* struct pt_regs, for the regs_* shims below */
  
  /* ---- pre-5.10 portability shims (legacy branch; see LEGACY_PORTING.md) ----
   *
-@@ -53,6 +54,22 @@
+@@ -53,6 +54,28 @@
  # endif
  #endif /* < 5.10 */
  
 +/* regs_set_return_value() is per-arch and only appeared in 5.5; arm64 4.19 has no such
 + * helper (arch/arm64/include/asm/syscall.h defines only syscall_get/set_return_value).
-+ * It is used by sus_map / sus_path / susfs_hide_syms, all of which include this header. */
++ * Used by sus_map / sus_path / susfs_hide_syms, all of which include this header. */
 +#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 5, 0) && defined(CONFIG_ARM64)
 +static inline void regs_set_return_value(struct pt_regs *regs, unsigned long val)
 +{
@@ -28,6 +28,12 @@ index 69e4605..46d7490 100644
 + * (1) equals the old notify=true. Used by susfs_supercall.c. */
 +#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 7, 0) && !defined(TWA_RESUME)
 +#define TWA_RESUME true
++#endif
++
++/* regs_get_kernel_argument() is 5.5+; on arm64 the syscall arguments are simply the
++ * first registers. Used by sus_path.c and susfs_hide_syms.c. */
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 5, 0) && !defined(regs_get_kernel_argument)
++#define regs_get_kernel_argument(regs, n)	((regs)->regs[n])
 +#endif
 +
  /* A kernel pointer taken out of a kprobe register, checked before dereference: single_open()'s fake inode is (void *)1
