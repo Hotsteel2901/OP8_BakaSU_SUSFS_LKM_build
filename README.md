@@ -38,6 +38,7 @@
 | `kernel_commit` | `lineage-23.2` | 内核拉取分支/提交（默认最新） |
 | `patch_base` | `4238ee49a84b` | DS/RK 补丁在最新内核打失败时的回退基线 |
 | `manager_ref` | `main` | BakaSU 拉取引用 |
+| `susfs_enable` | **true** | 是否集成 SUSFS-LKM；**关**则跳过其克隆/打补丁/编译，产物不带 `susfs_guard_lkm.ko`（内核本身不含 SUSFS，它只是外置模块），产物名加 `-nosusfs` |
 | `susfs_lkm_ref` | `legacy` | SUSFS-LKM 拉取引用（`Hotsteel2901/susfs4ksu-lkm`） |
 | `vfs_hybridmount` | **false** | VFS 后端：Hybrid Mount（与 NoMount 互斥，最多开一个） |
 | `vfs_nomount` | **false** | VFS 后端：NoMount（与 Hybrid Mount 互斥，最多开一个） |

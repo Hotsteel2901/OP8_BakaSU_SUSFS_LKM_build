@@ -34,6 +34,11 @@ on:
         required: false
         type: string
         default: 'main'
+      susfs_enable:
+        description: 'Integrate SUSFS-LKM (default on; off = build kernel + BakaSU LKM only, no susfs_guard_lkm.ko)'
+        required: true
+        type: boolean
+        default: true
       susfs_lkm_ref:
         description: 'SUSFS-LKM ref (branch/tag/commit) to pull'
         required: false
@@ -144,6 +149,7 @@ jobs:
           fi
 
       - name: Clone SUSFS-LKM + apply 4.19 adaptation patches
+        if: inputs.susfs_enable
         run: |
           git clone --depth=1 --single-branch -b "$SUSFS_LKM_REF" "$SUSFS_LKM_SOURCE" susfs_lkm
           cd susfs_lkm
@@ -201,6 +207,16 @@ jobs:
             echo "VFS_LABEL=" >> $GITHUB_ENV
           fi
           echo "[+] Artifact suffix will be: '${VFS_LABEL:-(none)}'"
+
+          # SUSFS-LKM 开关：关则跳过 SUSFS-LKM 的克隆/打补丁/编译，产物也不带
+          # susfs_guard_lkm.ko（内核本身不含 SUSFS，它只是外置模块）。
+          if [ "${{ inputs.susfs_enable }}" = "true" ]; then
+            echo "SUSFS_LABEL=" >> $GITHUB_ENV
+            echo "[i] SUSFS-LKM enabled (will build susfs_guard_lkm.ko)."
+          else
+            echo "SUSFS_LABEL=-nosusfs" >> $GITHUB_ENV
+            echo "[i] SUSFS-LKM disabled - building kernel + BakaSU LKM only."
+          fi
 
       - name: Patch kernel - ReKernel-X + DroidSpaces (auto-fallback to verified base)
         run: |
@@ -402,6 +418,7 @@ jobs:
           strings kernelsu.ko | grep -m1 '^vermagic' || true
 
       - name: Build SUSFS-LKM (susfs_guard_lkm.ko)
+        if: inputs.susfs_enable
         run: |
           cd susfs_lkm/kernel
           # 外置构建，针对同一个已准备的内核树。SUSFS-LKM 通过运行时符号解析 +
@@ -458,7 +475,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: boot-patched-bakasu-lkm${{ env.VFS_LABEL }}
+          name: boot-patched-bakasu-lkm${{ env.VFS_LABEL }}${{ env.SUSFS_LABEL }}
           path: |
             out_img/kernelsu_patched_*.img
             bakasu/kernel/kernelsu.ko
