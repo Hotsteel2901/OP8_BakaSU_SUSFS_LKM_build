@@ -9,7 +9,12 @@
 - 工作目录里的 `*.patch` 会在克隆后、构建前应用（`patch -p1`）；失败即整条构建失败。
 
 > ⚠️ 上游 `legacy` 分支**明确声明未构建、未测试、无二进制**（`LEGACY_PORTING.md`）。
-> 本目录的补丁是 4.19 适配的**进行时**产物：以 CI 编译报错为输入迭代补齐。
+> 本目录的补丁是 4.19 适配的产物：以编译报错为输入逐条补齐。
+>
+> **当前状态（本地已验证）**：在 lineage-23.2 的 4.19 树上（defconfig + oplus + droidspaces
+> + `KPROBES/KRETPROBES/FTRACE_SYSCALLS`）**完整编译通过，0 error**，产出
+> `fs/susfs_guard_lkm.o` → `susfs_guard_lkm.ko`（clang-14 实测；CI 用 clang-18）。
+> 加载/运行期（ksud 解析符号 + 真机功能）仍需真机验证。
 
 ## 为什么这条路对我们的价值
 
@@ -72,8 +77,8 @@ SUSFS 可以独立升级、不依赖 in-tree SUSFS 补丁（也绕开上游 Baka
 
 | 补丁 | 解决问题 |
 |---|---|
-| `0001-susfs_h-...` | `susfs.h` 集中补三处 `<5.10/5.5/5.7` 兼容：`regs_set_return_value()`（4.19 arm64 无，`sus_map`/`sus_path`/`susfs_hide_syms` 用），`TWA_RESUME`（`susfs_supercall.c` 的 `task_work_add`），`regs_get_kernel_argument()`（`sus_path.c`/`susfs_hide_syms.c` 用，4.19 无）。 |
-| `0004-sus_mount-419-mount-layout-and-statx.patch` | `sus_mount.c` 的 `fs/mount.h` 布局与 statx 差异：4.19 的 `struct mnt_namespace` **无 `ns_lock`**、无 `MNT_CURSOR`（`ns->list` 仍在）→ 新增 `< 5.7` 子分支（用 no-op 锁宏 + 去掉 cursor 判定，并把两处 `spin_lock(&ns->ns_lock)` 换成 `SUS_MOUNT_NS_LOCK(ns)`）；`struct statx` **无 `stx_mnt_id`**（5.8+）→ 门控掉 statx 的 mnt_id 改写。 |
+| `0001-susfs_h-...` | `susfs.h` 集中补 `<5.10/5.5/5.7` 兼容：`regs_set_return_value()`（4.19 arm64 无，`sus_map`/`sus_path`/`susfs_hide_syms` 用）、`TWA_RESUME`（`susfs_supercall.c` 的 `task_work_add`）、`regs_get_kernel_argument()`（`sus_path.c`/`susfs_hide_syms.c` 用，4.19 无）、以及 `<linux/ratelimit.h>`（4.19 的 `printk.h` 不包含它，`*_ratelimited` 会展开失败）。 |
+| `0004-sus_mount-419-mount-layout-and-statx.patch` | `sus_mount.c` 的 `fs/mount.h` 布局与 statx 差异：4.19 的 `struct mnt_namespace` **无 `ns_lock`**、无 `MNT_CURSOR`（`ns->list` 仍在）→ 新增 `< 5.7` 子分支（用 no-op 锁宏 + 去掉 cursor 判定，并把两处 `spin_lock(&ns->ns_lock)` 换成 `SUS_MOUNT_NS_LOCK(ns)`）；`struct statx` **无 `stx_mnt_id`**（5.8+）→ 门控掉 statx 的 mnt_id 改写（门控分支里把 `id/shown/new_id` 用 `(void)` 标记，避免 `-Wunused-variable` 报错）。 |
 | `0002-sus_path-drop-path_notify-pre52.patch` | `path_notify` 是 5.2+ 的 LSM hook，4.19 的 `security_hook_heads`/`security_list_options` 没有该成员。按 `>= 5.2` 门控掉该 hook（前向声明、静态断言、hook 结构体、处理函数、注册/注销列表项），4.19 上不安装它。 |
 | `0003-susfs_kstat-syscall_get_arguments-5args.patch` | 本 4.19 树的 arm64 `syscall_get_arguments` 是 **5 参**形式 `(task, regs, i, n, args)`，而源码用的是 3 参。改为 `(current, regs, 0, 6, args)`。 |
 

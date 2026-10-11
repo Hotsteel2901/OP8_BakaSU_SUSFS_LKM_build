@@ -1,16 +1,17 @@
 diff --git a/kernel/susfs.h b/kernel/susfs.h
-index 69e4605..9dc28a5 100644
+index 69e4605..1b7b852 100644
 --- a/kernel/susfs.h
 +++ b/kernel/susfs.h
-@@ -6,6 +6,7 @@
+@@ -6,6 +6,8 @@
  #include <linux/err.h>	/* IS_ERR */
  #include <linux/mm.h>	/* PAGE_SIZE */
  #include <linux/version.h>	/* LINUX_VERSION_CODE for the pre-5.10 shims below */
 +#include <asm/ptrace.h>		/* struct pt_regs, for the regs_* shims below */
++#include <linux/ratelimit.h>	/* DEFINE_RATELIMIT_STATE/__ratelimit for pr_*_ratelimited (4.19 printk.h does not pull this in) */
  
  /* ---- pre-5.10 portability shims (legacy branch; see LEGACY_PORTING.md) ----
   *
-@@ -53,6 +54,28 @@
+@@ -53,6 +55,28 @@
  # endif
  #endif /* < 5.10 */
  
