@@ -17,6 +17,11 @@ if [ ! -f "$KO" ]; then
 fi
 
 find_ksud() {
+    # KernelSU/BakaSU use /data/adb/ksud; FinaSU uses /data/adb/ksu/bin/ksud.
+    if [ -x /data/adb/ksu/bin/ksud ]; then
+        echo /data/adb/ksu/bin/ksud
+        return 0
+    fi
     if [ -x /data/adb/ksud ]; then
         echo /data/adb/ksud
         return 0

@@ -1,16 +1,19 @@
-name: Build 4.19 BakaSU LKM Kernel + SUSFS-LKM (OnePlus 8 / LOS 23.2)
+name: Build 4.19 FinaSU LKM Kernel + SUSFS-LKM (OnePlus 8 / LOS 23.2)
 
-# 基于 Hotsteel2901/OP8_KSU_LKM_build（已验证可用，管理器 = backslashxx/KernelSU）改造：
-#   - 管理器换成 BakaSU（Baka-SU/BakaSU，main 分支）
-#   - 额外构建 4.19 的 SUSFS-LKM（Hotsteel2901/susfs4ksu-lkm 的 legacy 分支 + 本仓库
-#     Patches/SUSFS-LKM/*.patch 的 4.19 适配）
+# 基于本仓库 master（管理器 = BakaSU）改造：
+#   - 管理器换成 FinaSU（LyraVoid/FinaSU）
+#   - 内核模块仍外置（CONFIG_KSU=m），ramdisk 注入 FinaSU 的 ksuinit + kernelsu.ko
+#   - 额外构建 4.19 的 SUSFS-LKM（Hotsteel2901/susfs4ksu-lkm legacy + 本仓库补丁）
 # 产出：
-#   - boot.img（header v2，已注入 BakaSU 的 ksuinit + kernelsu.ko）
-#   - kernelsu.ko（BakaSU LKM 驱动）
+#   - boot.img（header v2，已注入 FinaSU ksuinit + kernelsu.ko）
+#   - kernelsu.ko（FinaSU LKM 驱动）
 #   - susfs_guard_lkm.ko（SUSFS-LKM，运行时加载）
+#   - susfs-lkm-module.zip（开机自动 insmod 的 KernelSU 模块）
 #
-# 参考仓库的关键机制：ksud 在加载 .ko 时会用 /proc/kallsyms 预解析未定义符号并改写
-# vermagic，所以外置模块可以用运行时解析的符号（SUSFS-LKM 正是这样设计的）
+# 关键点：FinaSU 内核模块用 APK 签名（DER 大小 + SHA-256）认证管理器。
+# 工作流默认从最新 FinaSU Release 的 APK 里提取签名证书，并作为
+# KSU_EXPECTED_SIZE2 / KSU_EXPECTED_HASH2 编进 LKM；否则官方管理器不会
+# 被识别为 manager（root 授权界面打不开）。可显式覆盖。
 
 on:
   workflow_dispatch:
@@ -30,12 +33,24 @@ on:
         type: string
         default: '4238ee49a84b'
       manager_ref:
-        description: 'BakaSU ref (branch/tag/commit) to pull'
+        description: 'FinaSU ref (latest = newest GitHub release; or a tag/branch/commit)'
         required: false
         type: string
-        default: 'main'
+        default: 'latest'
+      manager_apk_url:
+        description: 'FinaSU manager APK URL (default: the release APK matching manager_ref/latest)'
+        required: false
+        type: string
+      manager_cert_size:
+        description: 'Override manager signing cert size (hex, e.g. 0x02cc); requires manager_cert_hash'
+        required: false
+        type: string
+      manager_cert_hash:
+        description: 'Override manager signing cert SHA-256; requires manager_cert_size'
+        required: false
+        type: string
       susfs_enable:
-        description: 'Integrate SUSFS-LKM (default on; off = build kernel + BakaSU LKM only, no susfs_guard_lkm.ko)'
+        description: 'Integrate SUSFS-LKM (default on; off = build kernel + FinaSU LKM only)'
         required: true
         type: boolean
         default: true
@@ -63,9 +78,12 @@ env:
   KERNEL_REF: ${{ inputs.kernel_commit || 'lineage-23.2' }}
   PATCH_BASE: ${{ inputs.patch_base || '4238ee49a84b' }}
 
-  # Manager = BakaSU (ReSukiSU 后继). LKM 模式: CONFIG_KSU=m.
-  MANAGER_SOURCE: 'https://github.com/Baka-SU/BakaSU.git'
-  MANAGER_REF: ${{ inputs.manager_ref || 'main' }}
+  # Manager = FinaSU. LKM mode: CONFIG_KSU=m.
+  MANAGER_SOURCE: 'https://github.com/LyraVoid/FinaSU.git'
+  MANAGER_REF: ${{ inputs.manager_ref || 'latest' }}
+  MANAGER_APK_URL: ${{ inputs.manager_apk_url || '' }}
+  MANAGER_CERT_SIZE: ${{ inputs.manager_cert_size || '' }}
+  MANAGER_CERT_HASH: ${{ inputs.manager_cert_hash || '' }}
 
   # SUSFS-LKM 源码（legacy 分支面向 pre-5.10；4.19 适配见 Patches/SUSFS-LKM/）
   SUSFS_LKM_SOURCE: 'https://github.com/Hotsteel2901/susfs4ksu-lkm.git'
@@ -85,7 +103,7 @@ env:
 
 jobs:
   build-lkm:
-    name: 'Build BakaSU LKM boot.img + SUSFS-LKM'
+    name: 'Build FinaSU LKM boot.img + SUSFS-LKM'
     runs-on: ubuntu-latest
     timeout-minutes: 300
     steps:
@@ -99,21 +117,74 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             clang-18 libclang-18-dev \
             gcc-aarch64-linux-gnu gcc-x86-64-linux-gnu \
-            cpio zstd python3 bc bison flex libssl-dev
+            cpio zstd python3 bc bison flex libssl-dev zip unzip
           sudo ln -sf /usr/bin/clang-18 /usr/local/bin/clang
           sudo ln -sf /usr/lib/llvm-18/lib/libclang.so.1 /usr/lib/llvm-18/lib/libclang.so
           clang --version | head -1
 
-      - name: Setup Rust (for ksud / ksuinit)
+      - name: Setup Rust (stable; ksuinit + host ksud)
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           export PATH="$HOME/.cargo/bin:$PATH"
           rustup target add aarch64-unknown-linux-musl
-          # BakaSU 的 ksud 用了 #![feature(decl_macro)]，必须 nightly（官方 CI 也是 nightly）。
-          rustup toolchain install nightly --profile minimal
-          cargo +nightly --version
           rustc --version
+          cargo --version
+
+      - name: Resolve FinaSU ref + manager signing certificate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          api() {
+            if [ -n "${GH_TOKEN:-}" ]; then
+              curl -fsSL -H "Authorization: Bearer $GH_TOKEN" "$@"
+            else
+              curl -fsSL "$@"
+            fi
+          }
+
+          if [ "$MANAGER_REF" = "latest" ]; then
+            REL=$(api https://api.github.com/repos/LyraVoid/FinaSU/releases/latest)
+            MANAGER_REF=$(printf '%s' "$REL" | python3 -c 'import sys,json; print(json.load(sys.stdin)["tag_name"])')
+            echo "[+] latest FinaSU release: $MANAGER_REF"
+          fi
+          echo "MANAGER_REF=$MANAGER_REF" >> "$GITHUB_ENV"
+
+          if [ -n "$MANAGER_CERT_SIZE" ] || [ -n "$MANAGER_CERT_HASH" ]; then
+            if [ -z "$MANAGER_CERT_SIZE" ] || [ -z "$MANAGER_CERT_HASH" ]; then
+              echo "::error::manager_cert_size and manager_cert_hash must be set together"
+              exit 1
+            fi
+            echo "[i] using manager certificate override"
+            echo "KSU_EXPECTED_SIZE2=$MANAGER_CERT_SIZE" >> "$GITHUB_ENV"
+            echo "KSU_EXPECTED_HASH2=$MANAGER_CERT_HASH" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          if [ -z "$MANAGER_APK_URL" ]; then
+            # Prefer the APK from the selected release; fall back to latest for
+            # branches/commits that have no release of their own.
+            REL=$(api "https://api.github.com/repos/LyraVoid/FinaSU/releases/tags/$MANAGER_REF" 2>/dev/null || \
+                  api https://api.github.com/repos/LyraVoid/FinaSU/releases/latest)
+            MANAGER_APK_URL=$(printf '%s' "$REL" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(next((a["browser_download_url"] for a in d.get("assets",[]) if a.get("name","").endswith(".apk")), ""))')
+            if [ -z "$MANAGER_APK_URL" ]; then
+              echo "[i] selected release has no APK asset, using the latest release APK for the certificate"
+              REL=$(api https://api.github.com/repos/LyraVoid/FinaSU/releases/latest)
+              MANAGER_APK_URL=$(printf '%s' "$REL" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(next((a["browser_download_url"] for a in d.get("assets",[]) if a.get("name","").endswith(".apk")), ""))')
+            fi
+          fi
+          if [ -z "$MANAGER_APK_URL" ]; then
+            echo "::error::Cannot find a FinaSU manager APK. Pass manager_apk_url or manager_cert_size/hash."
+            exit 1
+          fi
+
+          echo "[+] manager APK: $MANAGER_APK_URL"
+          curl -fsSL --retry 3 "$MANAGER_APK_URL" -o /tmp/finasu-manager.apk
+          python3 "$GITHUB_WORKSPACE/tools/apk_cert.py" /tmp/finasu-manager.apk --env >> "$GITHUB_ENV"
+          echo "[+] trusted manager certificate:"
+          grep -E '^KSU_EXPECTED_(SIZE2|HASH2)=' "$GITHUB_ENV" | tail -2
 
       - name: Clone kernel (latest by default)
         run: |
@@ -127,25 +198,35 @@ jobs:
           fi
           echo "kernel HEAD: $(git rev-parse HEAD)"
 
-      - name: Clone BakaSU (manager)
+      - name: Clone FinaSU (manager)
         run: |
-          git clone --depth=1 --single-branch -b "$MANAGER_REF" "$MANAGER_SOURCE" bakasu
-          cd bakasu
-          echo "manager HEAD: $(git rev-parse HEAD)"
-          echo "KSU_VERSION: $(grep -oP 'KSU_VERSION :=.*' kernel/Kbuild | head -1)"
+          # A plain clone cannot use --branch for a commit SHA, so initialise and
+          # fetch the requested ref explicitly. Works for release tags, branches
+          # and reachable commit SHAs.
+          mkdir finasu
+          cd finasu
+          git init -q
+          git remote add origin "$MANAGER_SOURCE"
+          git fetch -q --depth=1 origin "$MANAGER_REF"
+          git checkout -q FETCH_HEAD
+          # Kbuild derives KSU_VERSION from `git rev-list --count HEAD`; a
+          # shallow clone reports 1 (KSU_VERSION=30001), which makes the
+          # manager show a bogus/outdated LKM version.  Fetch the full history.
+          git fetch -q --unshallow origin 2>/dev/null || true
+          echo "manager HEAD: $(git rev-parse HEAD) ($MANAGER_REF), commits: $(git rev-list --count HEAD)"
+          grep -n 'KERNEL_SU_UAPI_VERSION' kernel/include/uapi/supercall.h | head -2
 
-      - name: Apply BakaSU 4.19 compat patches
+      - name: Apply FinaSU 4.19 compatibility patches
         run: |
-          cd bakasu
-          # BakaSU 官方 LKM 只针对 GKI 5.10+；non-GKI 4.19 需要少量内核侧 API 适配，
-          # 见 Patches/BakaSU-419/README.md。按文件名顺序应用。
+          cd finasu
+          # 见 Patches/FinaSU-419/README.md。按文件名顺序应用。
           shopt -s nullglob
-          for p in "$GITHUB_WORKSPACE"/Patches/BakaSU-419/*.patch; do
+          for p in "$GITHUB_WORKSPACE"/Patches/FinaSU-419/*.patch; do
             echo "[+] applying $(basename "$p")"
             patch -p1 < "$p" || { echo "::error::$(basename "$p") failed to apply"; exit 1; }
           done
           if [ -n "$(find . -name '*.rej')" ]; then
-            echo "::error::BakaSU compat patches left .rej files:"; find . -name '*.rej'; exit 1
+            echo "::error::FinaSU compat patches left .rej files:"; find . -name '*.rej'; exit 1
           fi
 
       - name: Clone SUSFS-LKM + apply 4.19 adaptation patches
@@ -154,7 +235,6 @@ jobs:
           git clone --depth=1 --single-branch -b "$SUSFS_LKM_REF" "$SUSFS_LKM_SOURCE" susfs_lkm
           cd susfs_lkm
           echo "SUSFS-LKM HEAD: $(git rev-parse HEAD) ($SUSFS_LKM_REF)"
-          # 4.19 适配补丁（按名字排序应用；目录内 README.md 说明适配地图）
           shopt -s nullglob
           for p in "$GITHUB_WORKSPACE"/Patches/SUSFS-LKM/*.patch; do
             echo "[+] applying $(basename "$p")"
@@ -166,11 +246,6 @@ jobs:
 
       - name: Validate VFS backend selection (mutually exclusive)
         run: |
-          # Hybrid Mount 与 NoMount 互斥：都劫持同一层 VFS (inode_operations /
-          # file_operations / dentry_operations)，且各自使用独立不兼容的 keyring
-          # 协议（HybridMount 用 "hm1"，NoMount 用 "NOMOUNT"）。二者同源
-          # （HybridMount 的 vfs 子系统 fork 自 NoMount），同一内核里两套驱动
-          # 会互抢 hook。默认两个都关；开两个直接 fail。
           HM="${{ inputs.vfs_hybridmount }}"
           NM="${{ inputs.vfs_nomount }}"
           HM="${HM:-false}"
@@ -185,10 +260,7 @@ jobs:
           echo "  VFS_NOMOUNT     = $NM"
 
           if [ "$COUNT" -gt 1 ]; then
-            echo ""
             echo "[-] ERROR: VFS backends are mutually exclusive, but $COUNT are enabled."
-            echo "[-] Hybrid Mount and NoMount hijack the same VFS layer and use"
-            echo "[-] incompatible keyring protocols. Enable at most ONE of them."
             exit 1
           fi
 
@@ -208,14 +280,12 @@ jobs:
           fi
           echo "[+] Artifact suffix will be: '${VFS_LABEL:-(none)}'"
 
-          # SUSFS-LKM 开关：关则跳过 SUSFS-LKM 的克隆/打补丁/编译，产物也不带
-          # susfs_guard_lkm.ko（内核本身不含 SUSFS，它只是外置模块）。
           if [ "${{ inputs.susfs_enable }}" = "true" ]; then
             echo "SUSFS_LABEL=" >> $GITHUB_ENV
             echo "[i] SUSFS-LKM enabled (will build susfs_guard_lkm.ko)."
           else
             echo "SUSFS_LABEL=-nosusfs" >> $GITHUB_ENV
-            echo "[i] SUSFS-LKM disabled - building kernel + BakaSU LKM only."
+            echo "[i] SUSFS-LKM disabled - building kernel + FinaSU LKM only."
           fi
 
       - name: Patch kernel - ReKernel-X + DroidSpaces (auto-fallback to verified base)
@@ -237,7 +307,7 @@ jobs:
           fi
           grep -q "rekernel_x" drivers/Makefile || printf "\nobj-\$(CONFIG_REKERNEL_X) += rekernel_x/\n" >> drivers/Makefile
           grep -q 'rekernel_x' drivers/Kconfig || sed -i "/endmenu/i\source \"drivers/rekernel_x/Kconfig\"" drivers/Kconfig
-          echo "-g$(git rev-parse --short HEAD)-hotsteel-BakaSU-LKM" > .scmversion
+          echo "-g$(git rev-parse --short HEAD)-hotsteel-FinaSU-LKM" > .scmversion
           echo "[+] scmversion: $(cat .scmversion)"
 
       - name: DroidSpaces cgroup prefix fix check
@@ -254,8 +324,6 @@ jobs:
         if: inputs.vfs_hybridmount == true
         run: |
           cd device_kernel
-          # 顺序约束：必须排在 ReKernel-X 步骤之后（那条 fallback 会 git clean -fd）。
-          # 4.19 属 legacy (>=5.10 才有预编译 .ko)，必须 built-in (=y)。
           cp "$GITHUB_WORKSPACE/Patches/HybridMount/hybridmount_patch_to_4.19.patch" ./
           patch -p1 < hybridmount_patch_to_4.19.patch
           rm -f hybridmount_patch_to_4.19.patch
@@ -263,23 +331,21 @@ jobs:
           if [ -n "$(find . -name '*.rej')" ]; then
             echo "[-] hybridmount_patch has rejected hunks:"; find . -name "*.rej"; false
           fi
-          test -f fs/hybridmount/hybridmount.c || { echo "[-] fs/hybridmount/hybridmount.c missing"; false; }
-          grep -qF 'obj-$(CONFIG_HYBRIDMOUNT) += hybridmount/' fs/Makefile || { echo "[-] fs/Makefile not wired"; false; }
-          grep -qF 'source "fs/hybridmount/Kconfig"' fs/Kconfig || { echo "[-] fs/Kconfig not wired"; false; }
+          test -f fs/hybridmount/hybridmount.c
+          grep -qF 'obj-$(CONFIG_HYBRIDMOUNT) += hybridmount/' fs/Makefile
+          grep -qF 'source "fs/hybridmount/Kconfig"' fs/Kconfig
           echo "[+] Hybrid Mount VFS subsystem patched (built-in)."
 
       - name: Patch NoMount VFS Subsystem
         if: inputs.vfs_nomount == true
         run: |
           cd device_kernel
-          # 同上：必须排在 ReKernel-X 步骤之后。
-          # 显式传固定 commit（env.NOMOUNT_COMMIT）而不是跟 dev 头部。
           curl -sSL "https://raw.githubusercontent.com/maxsteeel/nomount/${NOMOUNT_COMMIT}/kernel/setup.sh" | bash -s "$NOMOUNT_COMMIT"
           find . -name "*.orig" -delete
-          test -d fs/nomount || { echo "[-] fs/nomount missing (symlink not created)"; false; }
-          test -f fs/nomount/nomount.c || { echo "[-] fs/nomount/nomount.c missing"; false; }
-          grep -q "nomount" fs/Makefile || { echo "[-] fs/Makefile not wired"; false; }
-          grep -q "fs/nomount/Kconfig" fs/Kconfig || { echo "[-] fs/Kconfig not wired"; false; }
+          test -d fs/nomount
+          test -f fs/nomount/nomount.c
+          grep -q "nomount" fs/Makefile
+          grep -q "fs/nomount/Kconfig" fs/Kconfig
           echo "[+] NoMount VFS subsystem patched (built-in, commit ${NOMOUNT_COMMIT})."
 
       - name: Generate kernel config (defconfig + oplus + droidspaces, no LTO/CFI, kprobes on)
@@ -287,23 +353,20 @@ jobs:
           cd device_kernel
           export OUT="$PWD/out"
           mkdir -p "$OUT"
-          # CC=clang MUST be a command-line make arg (Makefile overrides env CC)
           make O="$OUT" CC=clang ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- vendor/kona-perf_defconfig
           MAKEFLAGS="CC=clang ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu-" \
             scripts/kconfig/merge_config.sh -m -O "$OUT" "$OUT/.config" \
               arch/arm64/configs/vendor/oplus.config \
               "$GITHUB_WORKSPACE/Patches/Droidspaces/droidspaces.config"
-          # 关 LTO/CFI（CFI 内核不能加载非 CFI 的 ksu.ko / SUSFS-LKM）；
-          # 开 ReKernel-X；开 KPROBES/KRETPROBES（SUSFS-LKM 的 dirent 过滤与符号
-          # 自举依赖它们）：
-          #   - BakaSU LKM 的 syscall hook 改走「直接改写 sys_call_table」实现
-          #     （CONFIG_KSU_SYSCALL_TABLE_HOOK=y，见 Patches/BakaSU-419/0002），
-          #     不再依赖 GKI 的 sys_enter tracepoint（non-GKI 4.19 上不可用），
-          #     因此这里保留 FTRACE/TRACEPOINTS 仅为兼容/日志用途。
-          #   - SUSFS-LKM 的 dirent 过滤与符号自举依赖 KPROBES/KRETPROBES
+          # FinaSU LKM 依赖：
+          #   - KPROBES/KRETPROBES：syscall tracepoint 注册计数、SELinux/文件 hook
+          #   - FTRACE_SYSCALLS/TRACEPOINTS：sys_enter tracepoint（4.19 上验证可用）
+          #   - MODULES/MODVERSIONS：外置 kernelsu.ko
+          # 必须关 LTO/CFI：非 CFI 的 .ko 在 CFI 内核上首次间接调用即 panic。
           ./scripts/config --file "$OUT/.config" \
             -e LTO_NONE -d LTO_CLANG -d THINLTO -d CFI_CLANG -d CFI_CLANG_SHADOW \
             -e REKERNEL_X \
+            -e KALLSYMS -e KALLSYMS_ALL \
             -e KPROBES -e KRETPROBES -e FTRACE -e FTRACE_SYSCALLS -e TRACEPOINTS
 
           case "$VFS_LABEL" in
@@ -324,10 +387,10 @@ jobs:
 
           make O="$OUT" CC=clang ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
           echo "=== key config after olddefconfig ==="
-          grep -E "^CONFIG_KSU=|^CONFIG_LTO|^CONFIG_CFI|^CONFIG_MODULES=|^CONFIG_KPROBES=|^CONFIG_KRETPROBES=|^CONFIG_FTRACE_SYSCALLS=|^CONFIG_REKERNEL_X=" "$OUT/.config" || true
+          grep -E "^CONFIG_(KSU|LTO|CFI|MODULES|MODVERSIONS|KPROBES|KRETPROBES|FTRACE_SYSCALLS|REKERNEL_X|SECURITY_SELINUX)=" "$OUT/.config" || true
 
-          for k in CONFIG_KPROBES CONFIG_KRETPROBES; do
-            grep -qE "^${k}=y" "$OUT/.config" || { echo "[-] ${k} not enabled (required by BakaSU LKM / SUSFS-LKM)"; false; }
+          for k in CONFIG_KPROBES CONFIG_KRETPROBES CONFIG_MODULES CONFIG_KALLSYMS_ALL; do
+            grep -qE "^${k}=y" "$OUT/.config" || { echo "[-] ${k} not enabled (required by FinaSU LKM)"; false; }
           done
 
           case "$VFS_LABEL" in
@@ -350,23 +413,23 @@ jobs:
           make O="$OUT" CC=clang ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- security/selinux/avc.o
           ls -la "$OUT/include/generated/compile.h" "$OUT/security/selinux/flask.h"
 
-      - name: Build kernel Image (full tree — BakaSU check_symbol / SUSFS-LKM need vmlinux)
+      - name: Build kernel Image (full tree — FinaSU / SUSFS-LKM need vmlinux + Module.symvers)
         run: |
           cd device_kernel
           export OUT="$PWD/out"
           make O="$OUT" CC=clang ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- -j"$JOBS" Image
-          ls -la "$OUT/arch/arm64/boot/Image"
-          ./scripts/extract-ikconfig "$OUT/arch/arm64/boot/Image" 2>/dev/null | grep -E "^CONFIG_LTO|^CONFIG_CFI|^CONFIG_KPROBES|^CONFIG_KRETPROBES" || true
+          ls -la "$OUT/arch/arm64/boot/Image" "$OUT/vmlinux"
+          ./scripts/extract-ikconfig "$OUT/arch/arm64/boot/Image" 2>/dev/null | grep -E "^CONFIG_(LTO|CFI|KPROBES|KRETPROBES|MODVERSIONS)" || true
 
-      - name: Build ksuinit (aarch64, for ramdisk injection)
+      - name: Build ksuinit (static musl, for ramdisk injection)
         run: |
-          # BakaSU 没有 workspace 根 Cargo.toml（backslashxx 有，所以那边能 `--package`）。
-          # ksuinit / ksud 是两个独立 crate，必须进各自目录构建。
-          cd bakasu/userspace/ksuinit
+          cd finasu
+          # FinaSU's ksuinit is a separate workspace member.  Build a static
+          # aarch64-musl binary: it must run before /system/bin/init, without
+          # any Android linker or /system libraries.
           export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
-          export CARGO_PROFILE_RELEASE_LTO=false
           set +e; set -o pipefail
-          cargo build --target=aarch64-unknown-linux-musl --release -j"$JOBS" 2>&1 | tee /tmp/ksuinit_build.log
+          cargo build -p ksuinit --target=aarch64-unknown-linux-musl --release -j"$JOBS" 2>&1 | tee /tmp/ksuinit_build.log
           rc=${PIPESTATUS[0]}
           set -e
           if [ "$rc" -ne 0 ]; then
@@ -374,48 +437,45 @@ jobs:
             grep -nE 'error\[|^error:|cannot find|failed to|not found|does not have' /tmp/ksuinit_build.log | tail -25 | while IFS= read -r l; do echo "::error::$l"; done
             exit 1
           fi
-          mkdir -p ../ksud/bin/aarch64
-          cp target/aarch64-unknown-linux-musl/release/ksuinit ../ksud/bin/aarch64/ksuinit
-          file ../ksud/bin/aarch64/ksuinit
+          mkdir -p userspace/ksud/bin/aarch64
+          cp target/aarch64-unknown-linux-musl/release/ksuinit userspace/ksud/bin/aarch64/ksuinit
+          file userspace/ksud/bin/aarch64/ksuinit
 
-      - name: Patch ksud (allow boot header v2) and build host ksud
+      - name: Build host ksud (boot-patch tool, embeds ksuinit)
         run: |
-          cd bakasu
-          patch -p1 < "$GITHUB_WORKSPACE/Patches/ksud-v2.patch"
-          # 同上：ksud 是独立 crate，进它自己的目录构建（不是 workspace --package）。
-          cd userspace/ksud
-          export CARGO_PROFILE_RELEASE_LTO=false
-          export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
-          # ksud 需要 nightly（#![feature(decl_macro)]）。
+          cd finasu
+          # The host ksud embeds ../ksud/bin/aarch64/ksuinit at compile time; it
+          # is used only to patch the boot image in CI.
           set +e; set -o pipefail
-          cargo +nightly build --release -j"$JOBS" 2>&1 | tee /tmp/ksud_build.log
+          cargo build -p ksud --release -j"$JOBS" 2>&1 | tee /tmp/ksud_build.log
           rc=${PIPESTATUS[0]}
           set -e
           if [ "$rc" -ne 0 ]; then
-            echo "::error::ksud build failed (rc=$rc)"
+            echo "::error::host ksud build failed (rc=$rc)"
             grep -nE 'error\[|^error:|cannot find|failed to|not found|does not have' /tmp/ksud_build.log | tail -25 | while IFS= read -r l; do echo "::error::$l"; done
             exit 1
           fi
           ./target/release/ksud --version
 
-      - name: Build BakaSU LKM driver (kernelsu.ko)
+      - name: Build FinaSU LKM driver (kernelsu.ko)
         run: |
-          cd bakasu/kernel
-          # LKM 模式：CONFIG_KSU=m。BakaSU 的 Kconfig 里 KSU_MANUAL_HOOK 明确
-          # depends on KSU != m，因此 LKM 走 syscall hook。其默认实现靠 GKI 的
-          # sys_enter tracepoint 重定向，在 non-GKI 4.19 上不可用，所以额外开
-          # CONFIG_KSU_SYSCALL_TABLE_HOOK=y（Patches/BakaSU-419/0002）：直接改写
-          # sys_call_table，按 syscall 号分发，原 syscall 走影子表。
+          cd finasu/kernel
+          # LKM 模式：CONFIG_KSU=m，外置模块针对刚构建的 4.19 内核树。
+          # KSU_EXPECTED_SIZE2/HASH2 让内核信任官方 FinaSU 管理器 APK 的签名；
+          # KSU_SECOND_SIGNATURE_RELEASE=1 表示第二个签名槽是发布证书。
           set +e; set -o pipefail
           make -C "$GITHUB_WORKSPACE/device_kernel" O="$GITHUB_WORKSPACE/device_kernel/out" M="$PWD" \
-            CONFIG_KSU=m CONFIG_KSU_TRACEPOINT_HOOK=y CONFIG_KSU_SYSCALL_TABLE_HOOK=y \
+            CONFIG_KSU=m \
+            KSU_EXPECTED_SIZE2="$KSU_EXPECTED_SIZE2" \
+            KSU_EXPECTED_HASH2="$KSU_EXPECTED_HASH2" \
+            KSU_SECOND_SIGNATURE_RELEASE=1 \
             CC=clang ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
             -j"$JOBS" modules 2>&1 | tee /tmp/ksu_build.log
           rc=${PIPESTATUS[0]}
           set -e
           if [ "$rc" -ne 0 ]; then
-            echo "::error::BakaSU kernelsu.ko build failed (rc=$rc)"
-            grep -nE 'error:|fatal error:|Error [0-9]|undefined reference|No such file|No rule to make' /tmp/ksu_build.log | tail -25 | while IFS= read -r l; do echo "::error::$l"; done
+            echo "::error::FinaSU kernelsu.ko build failed (rc=$rc)"
+            grep -nE 'error:|fatal error:|Error [0-9]|undefined reference|No such file|No rule to make' /tmp/ksu_build.log | tail -30 | while IFS= read -r l; do echo "::error::$l"; done
             exit 1
           fi
           ls -la kernelsu.ko
@@ -425,10 +485,6 @@ jobs:
         if: inputs.susfs_enable
         run: |
           cd susfs_lkm/kernel
-          # 外置构建，针对同一个已准备的内核树。SUSFS-LKM 通过运行时符号解析 +
-          # 自身 /proc 接口工作，未定义符号由 ksud 加载时从 /proc/kallsyms 解析。
-          # ⚠️ 4.19 适配进行中（上游 legacy 未编译未验证）：本步失败时把关键错误行以
-          # ::error:: 输出，便于在 CI annotations 里定位（见 Patches/SUSFS-LKM/README.md）。
           set +e; set -o pipefail
           make -C "$GITHUB_WORKSPACE/device_kernel" O="$GITHUB_WORKSPACE/device_kernel/out" M="$PWD" \
             CC=clang ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
@@ -436,7 +492,7 @@ jobs:
           rc=${PIPESTATUS[0]}
           set -e
           if [ "$rc" -ne 0 ]; then
-            echo "::error::SUSFS-LKM build failed (rc=$rc) — 4.19 adaptation in progress; see Patches/SUSFS-LKM/README.md"
+            echo "::error::SUSFS-LKM build failed (rc=$rc) — see Patches/SUSFS-LKM/README.md"
             grep -nE 'error:|fatal error:|Error [0-9]|undefined reference|No such file|No rule to make|incompatible|implicit declaration' /tmp/susfs_build.log | tail -30 | while IFS= read -r l; do echo "::error::$l"; done
             exit 1
           fi
@@ -444,11 +500,6 @@ jobs:
 
       - name: Verify external modules (unresolved symbols + vermagic)
         run: |
-          # ksuinit / ksud 会把 .ko 的未定义符号用 /proc/kallsyms 改写成绝对地址，
-          # 然后调用 init_module()。任何在运行内核里不存在的符号都会让
-          # init_module() 直接失败（-ENOENT），但 `make modules` 只打印 WARNING，
-          # 构建仍然"成功"——这就是刷入后模块静默不加载的根因之一。
-          # 这里把"符号不存在 / vermagic 不一致"变成硬失败，避免再产出坏 boot.img。
           set -e
           OUT="$GITHUB_WORKSPACE/device_kernel/out"
           SYMS="$OUT/System.map"
@@ -470,20 +521,18 @@ jobs:
               "$UTS "*) ;;
               *) echo "::error::$name vermagic does not match kernel release '$UTS'"; return 1 ;;
             esac
-            # Weak undefined symbols are allowed to stay unresolved; the kernel
-            # loader accepts them. Only GLOBAL undefs are fatal.
             aarch64-linux-gnu-nm -u "$ko" | awk '$1 == "U" {print $2}' | sort -u > /tmp/${name}.undef
             missing=$(comm -23 /tmp/${name}.undef /tmp/kernel_syms.txt || true)
             if [ -n "$missing" ]; then
               echo "::error::$name references symbols missing from the kernel:"
               echo "$missing" | while IFS= read -r s; do echo "::error::  $s"; done
-              echo "::error::ksud/ksuinit cannot resolve these from /proc/kallsyms; init_module() will fail."
+              echo "::error::ksuinit/ksud cannot resolve these from /proc/kallsyms; init_module() will fail."
               return 1
             fi
             echo "[+] all $(wc -l < /tmp/${name}.undef) undefined symbols resolved"
           }
 
-          check_ko "$GITHUB_WORKSPACE/bakasu/kernel/kernelsu.ko"
+          check_ko "$GITHUB_WORKSPACE/finasu/kernel/kernelsu.ko"
           if [ "${{ inputs.susfs_enable }}" = "true" ]; then
             check_ko "$GITHUB_WORKSPACE/susfs_lkm/kernel/susfs_guard_lkm.ko"
           fi
@@ -491,9 +540,6 @@ jobs:
       - name: Package SUSFS-LKM KernelSU module (susfs-lkm-module.zip)
         if: inputs.susfs_enable
         run: |
-          # SUSFS 是外置运行时模块，不会被 boot-patch 注入 boot.img。
-          # 这里把编好的 susfs_guard_lkm.ko 与模块模板打成一个 KernelSU 模块 zip，
-          # 在管理器里装一次即可开机自动 `ksud insmod`（见 susfs-module/README.md）。
           rm -rf mod_stage
           mkdir -p mod_stage
           cp "$GITHUB_WORKSPACE"/susfs-module/module.prop mod_stage/
@@ -522,18 +568,18 @@ jobs:
           fi
           python3 "$GITHUB_WORKSPACE/tools/boot_info.py" base_out/boot.img
 
-      - name: Swap kernel + inject BakaSU LKM into boot.img
+      - name: Swap kernel + inject FinaSU LKM into boot.img
         run: |
           mkdir -p out_img
           python3 "$GITHUB_WORKSPACE/tools/swap_kernel.py" \
             base_out/boot.img \
             device_kernel/out/arch/arm64/boot/Image \
             out_img/swapped.img
-          # BakaSU 的 boot-patch 参数与 backslashxx 不同：没有 --arch（用 --kmi 自动检测），
-          # 用 --boot/--module/--out。输出名为 kernelsu_patched_<timestamp>.img。
-          bakasu/userspace/ksud/target/release/ksud boot-patch \
+          # FinaSU 的 boot-patch 参数：--boot/--module/--out，输出
+          # kernelsu_patched_<timestamp>.img；Patches 0004 放行 OnePlus 8 的 v2 头。
+          finasu/target/release/ksud boot-patch \
             --boot out_img/swapped.img \
-            --module bakasu/kernel/kernelsu.ko \
+            --module finasu/kernel/kernelsu.ko \
             --out out_img/
           ls -la out_img/
 
@@ -544,10 +590,10 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: boot-patched-bakasu-lkm${{ env.VFS_LABEL }}${{ env.SUSFS_LABEL }}
+          name: boot-patched-finasu-lkm${{ env.VFS_LABEL }}${{ env.SUSFS_LABEL }}
           path: |
             out_img/kernelsu_patched_*.img
-            bakasu/kernel/kernelsu.ko
+            finasu/kernel/kernelsu.ko
             susfs_lkm/kernel/susfs_guard_lkm.ko
             susfs-lkm-module.zip
           if-no-files-found: error

@@ -1,8 +1,8 @@
 diff --git a/userspace/ksud/src/boot_patch.rs b/userspace/ksud/src/boot_patch.rs
-index f952c2f..3f2163a 100644
+index 02c94550..44cc5e4c 100644
 --- a/userspace/ksud/src/boot_patch.rs
 +++ b/userspace/ksud/src/boot_patch.rs
-@@ -407,10 +407,11 @@ fn extract_ramdisk(ramdisk_image: &RamdiskImage) -> Result<(Cpio, Option<usize>)
+@@ -408,10 +408,13 @@ fn extract_ramdisk(ramdisk_image: &RamdiskImage) -> Result<(Cpio, Option<usize>)
  }
  
  fn enforce_bootimage_version(boot: &BootImage<'_>) -> Result<()> {
@@ -12,6 +12,8 @@ index f952c2f..3f2163a 100644
 -        bail!("bootimage version {ver} is not supported!")
 +    if let BootImageVersion::Android(ver) = boot.get_header().get_version() {
 +        println!("- Boot image header version: {ver}");
++        // OnePlus 8 (and other pre-GKI devices) use the header v2 boot image.
++        // The patcher handles v2 through v4; only reject newer/unknown ones.
 +        if ver > 4 {
 +            bail!("bootimage version {ver} is not supported!")
 +        }

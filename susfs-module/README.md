@@ -6,16 +6,16 @@
 
 ## 为什么需要它
 
-BakaSU 的 `ksud boot-patch` 只把 `kernelsu.ko` 注入 boot 的 ramdisk；SUSFS 是**外置
+FinaSU 的 `ksud boot-patch` 只把 `kernelsu.ko` 注入 boot 的 ramdisk；SUSFS 是**外置
 运行时模块**（`susfs_guard_lkm.ko`），不会被打进 boot.img。本模块负责在开机时用
-`ksud insmod` 把它加载起来，这样刷完 boot.img 后到管理器里装一次本模块即可。
+FinaSU 的 `ksud insmod` 把它加载起来，这样刷完 boot.img 后到管理器里装一次本模块即可。
 
 ## 安装
 
-1. 刷入 `boot-patched-bakasu-lkm*.img`（内含 `kernelsu.ko`）。
-2. 在 KernelSU/BakaSU 管理器里安装 `susfs-lkm-module.zip`，或：
+1. 刷入 `boot-patched-finasu-lkm*.img`（内含 `kernelsu.ko`）。
+2. 在 FinaSU 管理器里安装 `susfs-lkm-module.zip`，或：
    ```sh
-   ksud module install /path/to/susfs-lkm-module.zip
+   /data/adb/ksu/bin/ksud module install /path/to/susfs-lkm-module.zip
    ```
 3. 重启。
 
@@ -34,7 +34,7 @@ BakaSU 的 `ksud boot-patch` 只把 `kernelsu.ko` 注入 boot 的 ramdisk；SUSF
 cat /data/adb/susfs_lkm.log
 lsmod | grep susfs
 # 手动加载 / 卸载：
-ksud insmod /data/adb/modules/susfs_lkm/susfs_guard_lkm.ko
+/data/adb/ksu/bin/ksud insmod /data/adb/modules/susfs_lkm/susfs_guard_lkm.ko
 rmmod susfs_guard_lkm
 ```
 

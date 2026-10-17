@@ -1,9 +1,13 @@
 # build artifacts (if building locally)
 device_kernel/
+finasu/
+susfs_lkm/
+mod_stage/
 kernelsu/
 out_img/
 base_out/
 *.img
 *.ko
+susfs-lkm-module.zip
 __pycache__/
 !base/boot.img

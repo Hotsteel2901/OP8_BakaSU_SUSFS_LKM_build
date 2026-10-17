@@ -2,6 +2,10 @@
 
 本目录记录对补丁与工作流的**结构性变更**及其原因、验证方式与踩坑。每次大改追加一节，不删旧记录。
 
+> 说明：本目录是 `master`（管理器 = BakaSU）时期的变更存档。`finasu` 分支沿用其中
+> 内核 / SUSFS-LKM 的结论；凡提到 BakaSU 管理器、`boot-patched-bakasu-*` 或
+> `Patches/BakaSU-419` 的地方均为历史记录，当前分支对应物见 `Patches/FinaSU-419`。
+
 ---
 
 ## 2026-10-05:上游核对 + Re:Kernel → ReKernel-X + VFS 后端开关
@@ -270,3 +274,48 @@ drwxr-xr-x 6 root root 0 ... /sys/module/susfs_guard_lkm
 | **`kptr_restrict=2` 时连 root 都看到 0** | 排查时先 `echo 0 > /proc/sys/kernel/kptr_restrict`（root/CAP_SYSLOG），否则 `/proc/kallsyms` 地址全为 0 |
 | **`ksud module install` 是延迟生效** | 新文件被放进 `/data/adb/modules_update/<id>/`，活动目录里的旧 `.ko` 不会立即替换，并写入 `update` 标记，重启后才切换。验证时对比两边 md5 |
 | **已加载模块不要重复 insmod** | SUSFS 从 `/proc/modules` 自隐藏，重复 `insmod` 返回 `-EEXIST`，看起来像“被拒”；判重看 `/sys/module/susfs_guard_lkm` |
+
+---
+
+## 2026-10-17（分支 `finasu`）：管理器换成 FinaSU
+
+### 1. 分支目标
+
+`master`（BakaSU）验证通过后，用户要求为 **LyraVoid/FinaSU** 构建 LKM。新建
+`finasu` 分支，内核/SUSFS/RKX/DS 机制不动，只替换管理器与对应的 4.19 适配。
+
+### 2. 关键差异
+
+- FinaSU 内核用 **APK 签名证书（DER 大小 + SHA-256）** 认证管理器；工作流默认从
+  最新 Release APK 的 v2 签名块提取（`tools/apk_cert.py`），编译成
+  `KSU_EXPECTED_SIZE2` / `KSU_EXPECTED_HASH2`，并设
+  `KSU_SECOND_SIGNATURE_RELEASE=1`。没有这一步官方管理器不会被识别。
+- FinaSU 的 `ksuinit` 用 5.2+ 的 `fsopen/fsmount/move_mount` 挂 `/proc`，4.19 上
+  失败 → 改成经典 `mount(2)`（`0003`），与 master 的 BakaSU 修复同因。
+- FinaSU 的 `ksud boot-patch` 只接受 header v3/v4 → 放行 v2（`0004`）。
+- FinaSU 的 SELinux `rules.c`/`sepolicy.c` 直接操作 5.10+ 的
+  `selinux_state.policy` → 换成 BakaSU/KernelSU 的 4.19 legacy 全局 policydb
+  实现（`0002`）；sepolicy 批量命令 ABI 保持不变。
+- FinaSU 的 SELinux hide / AVC spoof 和 seccomp bitmap cache 在 4.19 上编译为
+  no-op / stub（`0001`、`0002`），功能降级见根 README“限制”。
+- FinaSU 的 syscall hook 走 `sys_enter` tracepoint + 影子 dispatcher；4.19 的
+  `syscall_trace_enter()` 返回 `regs->syscallno`，因此**不需要** master 的直接
+  `sys_call_table` hook。
+
+### 3. 本地验证（未真机）
+
+使用 lineage-23.2 内核树 `98a7970af93b`、FinaSU v1.0.4（= main `40c97e2`）、
+Patches/FinaSU-419 全部补丁：
+
+| 校验 | 结果 |
+|---|---|
+| FinaSU `kernelsu.ko` | 编译成功，0 error；vermagic 与 `UTS_RELEASE` 一致 |
+| `ksuinit`（aarch64-musl） | 编译成功，421 KB 静态 ELF；反汇编/源码确认使用 `mount(2)` |
+| host `ksud` | aarch64 与 x86_64 宿主均编译成功；`ksud boot-patch` 正常 |
+| APK 证书提取 | v1.0.4 APK → `0x02cc` / `2d89b5...d448458` |
+| boot-patch（v2 基座） | 成功；ramdisk 内 `init` 与新编 `ksuinit` 逐字节一致，`init.real` + `kernelsu.ko` 均在 |
+| 符号/vermagic 自检 | CI 步骤沿用 master；本地模块未做真机 `init_module()` |
+
+> 真机刷入/开机验证尚未进行。刷入后优先看 `dmesg | grep -iE 'KernelSU|kernelsu|Cannot mount procfs'`、
+> 管理器是否识别 LKM、`/data/adb/susfs_lkm.log`。FinaSU 管理器需与构建时
+> `manager_ref` 对应（默认 `latest` = 最新 Release）。

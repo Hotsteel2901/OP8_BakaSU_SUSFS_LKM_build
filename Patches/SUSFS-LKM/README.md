@@ -25,8 +25,8 @@
 ## 为什么这条路对我们的价值
 
 我们本来就在编内核，LKM 的意义不是「省编译」，而是**让 SUSFS 与内核构建解耦**：
-SUSFS 可以独立升级、不依赖 in-tree SUSFS 补丁（也绕开上游 BakaSU 封 SUSFS 那类问题）。
-加载链复用 BakaSU 的 ksud：它会用 `/proc/kallsyms` 预解析未定义符号并改写 vermagic，
+SUSFS 可以独立升级、不依赖 in-tree SUSFS 补丁（也绕开不同管理器对 SUSFS 集成方式的差异）。
+加载链复用 FinaSU 的 ksud：它会用 `/proc/kallsyms` 预解析未定义符号并改写 vermagic，
 这正是 SUSFS-LKM 「运行时解析符号」所依赖的机制。
 
 ## 我们内核的硬前提（已核对 kona-perf_defconfig）
@@ -69,7 +69,7 @@ SUSFS 可以独立升级、不依赖 in-tree SUSFS 补丁（也绕开上游 Baka
 
 ### C. 加载/加载器（最容易出问题）
 - GKI 世界用 loader 从 `/proc/kallsyms` 绝对化未定义符号、绕过 export/CRC/KMI。
-  4.19 上走 **BakaSU 的 `ksud insmod`**（参考仓库已验证它做同样的事）。
+  4.19 上走 **FinaSU 的 `ksud insmod`**（它复用同一套 ksuinit 加载器，做同样的事）。
 - 我们的内核 `MODVERSIONS=y`：对树编译得到的 CRC 一致；未定义符号由 loader 绕过。
 
 ### D. 运行时验证（真机，来自上游 §5）
@@ -92,7 +92,7 @@ SUSFS 可以独立升级、不依赖 in-tree SUSFS 补丁（也绕开上游 Baka
 | `0002-sus_path-drop-path_notify-pre52.patch` | `path_notify` 是 5.2+ 的 LSM hook，4.19 的 `security_hook_heads`/`security_list_options` 没有该成员。按 `>= 5.2` 门控掉该 hook（前向声明、静态断言、hook 结构体、处理函数、注册/注销列表项），4.19 上不安装它。 |
 | `0003-susfs_kstat-syscall_get_arguments-5args.patch` | 本 4.19 树的 arm64 `syscall_get_arguments` 是 **5 参**形式 `(task, regs, i, n, args)`，而源码用的是 3 参。改为 `(current, regs, 0, 6, args)`。 |
 | `0005-spoof_cmdline-no-bootconfig-pre510.patch` | 4.19 没有 bootconfig，`saved_boot_config` 符号不存在；`spoof_cmdline.c` 引用它会让 `.ko` 留下一个 ksud 无法从 `/proc/kallsyms` 解析的未定义符号，`init_module()` 直接 `-ENOENT`。`< 5.10` 改为 no-op stub（该功能本来也不存在）。 |
-| `0006-patch_memory-pmd_sect-pre54.patch` | 4.19 arm64 没有 `pmd_leaf()`/`pud_leaf()`（只有 `pmd_sect()`/`pud_sect()`）。`patch_memory.c` 的 `phys_from_virt()` 只识别 leaf，PMD 段映射会被 `pmd_bad()` 当成坏表项 → `-ENOENT`，`security_hook_heads` 的 LSM 插入失败，fatal 的 `sus_path` 层拒绝整个模块加载（dmesg: `failed to find phy addr for patch dst ...`）。补上 `#elif defined(pmd_sect)` / `pud_sect` 分支（与 BakaSU 的 arm64 实现一致）。 |
+| `0006-patch_memory-pmd_sect-pre54.patch` | 4.19 arm64 没有 `pmd_leaf()`/`pud_leaf()`（只有 `pmd_sect()`/`pud_sect()`）。`patch_memory.c` 的 `phys_from_virt()` 只识别 leaf，PMD 段映射会被 `pmd_bad()` 当成坏表项 → `-ENOENT`，`security_hook_heads` 的 LSM 插入失败，fatal 的 `sus_path` 层拒绝整个模块加载（dmesg: `failed to find phy addr for patch dst ...`）。补上 `#elif defined(pmd_sect)` / `pud_sect` 分支（与 FinaSU/本仓库的 arm64 实现一致）。 |
 
 ## 迭代方式
 

@@ -1,0 +1,318 @@
+diff --git a/kernel/core/init.c b/kernel/core/init.c
+index 043590e6..6b683809 100644
+--- a/kernel/core/init.c
++++ b/kernel/core/init.c
+@@ -262,6 +262,6 @@ MODULE_AUTHOR("weishu");
+ MODULE_DESCRIPTION("Android KernelSU");
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+ MODULE_IMPORT_NS("VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver");
+-#else
++#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0)
+ MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
+ #endif
+diff --git a/kernel/hook/arm64/patch_memory.c b/kernel/hook/arm64/patch_memory.c
+index c344bd55..379a30fa 100644
+--- a/kernel/hook/arm64/patch_memory.c
++++ b/kernel/hook/arm64/patch_memory.c
+@@ -56,6 +56,12 @@ unsigned long phys_from_virt(unsigned long addr, int *err)
+         pr_debug("Address 0x%lx maps to a PUD-level huge page\n", addr);
+         return __pud_to_phys(*pud) + ((addr & ~PUD_MASK));
+     }
++#elif defined(pud_sect)
++    /* 4.19 arm64 has no pud_leaf(); pud_sect() reports section mappings. */
++    if (pud_sect(*pud)) {
++        pr_debug("Address 0x%lx maps to a PUD-level section\n", addr);
++        return __pud_to_phys(*pud) + ((addr & ~PUD_MASK));
++    }
+ #endif
+ 
+     pmd = pmd_offset(pud, addr);
+@@ -65,6 +71,14 @@ unsigned long phys_from_virt(unsigned long addr, int *err)
+         pr_debug("Address 0x%lx maps to a PMD-level huge page\n", addr);
+         return __pmd_to_phys(*pmd) + ((addr & ~PMD_MASK));
+     }
++#elif defined(pmd_sect)
++    /* 4.19 arm64 has no pmd_leaf(); kernel text/rodata is mapped with 2 MiB
++     * PMD sections.  Without this branch pmd_bad() rejects the section entry
++     * and patching sys_call_table / security_hook_heads fails. */
++    if (pmd_sect(*pmd)) {
++        pr_debug("Address 0x%lx maps to a PMD-level section\n", addr);
++        return __pmd_to_phys(*pmd) + ((addr & ~PMD_MASK));
++    }
+ #endif
+ 
+     if (pmd_none(*pmd) || pmd_bad(*pmd))
+diff --git a/kernel/infra/file_wrapper.c b/kernel/infra/file_wrapper.c
+index 7372df02..acc5f215 100644
+--- a/kernel/infra/file_wrapper.c
++++ b/kernel/infra/file_wrapper.c
+@@ -85,6 +85,7 @@ static ssize_t ksu_wrapper_write_iter(struct kiocb *iocb, struct iov_iter *iovi)
+     return orig->f_op->write_iter(iocb, iovi);
+ }
+ 
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+ static int ksu_wrapper_iopoll(struct kiocb *kiocb, struct io_comp_batch *icb, unsigned int v)
+ {
+@@ -102,6 +103,7 @@ static int ksu_wrapper_iopoll(struct kiocb *kiocb, bool spin)
+     return orig->f_op->iopoll(kiocb, spin);
+ }
+ #endif
++#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0) */
+ 
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
+ static int ksu_wrapper_iterate(struct file *fp, struct dir_context *dc)
+@@ -303,6 +305,7 @@ static ssize_t ksu_wrapper_copy_file_range(struct file *file_in, loff_t pos_in,
+     return orig->f_op->copy_file_range(file_in, pos_in, orig, pos_out, len, flags);
+ }
+ 
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)
+ // no REMAP_FILE_DEDUP: use file_in
+ // https://cs.android.com/android/kernel/superproject/+/common-android-mainline:common/fs/read_write.c;l=1598-1599;drc=398da7defe218d3e51b0f3bdff75147e28125b60
+ // https://cs.android.com/android/kernel/superproject/+/common-android-mainline:common/fs/remap_range.c;l=403-404;drc=398da7defe218d3e51b0f3bdff75147e28125b60
+@@ -321,6 +324,7 @@ static loff_t ksu_wrapper_remap_file_range(struct file *file_in, loff_t pos_in,
+         return orig->f_op->remap_file_range(orig, pos_in, file_out, pos_out, len, remap_flags);
+     }
+ }
++#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0) */
+ 
+ static int ksu_wrapper_fadvise(struct file *fp, loff_t off1, loff_t off2, int flags)
+ {
+@@ -361,7 +365,9 @@ static struct ksu_file_wrapper *ksu_create_file_wrapper(struct file *fp)
+     p->ops.write = fp->f_op->write ? ksu_wrapper_write : NULL;
+     p->ops.read_iter = fp->f_op->read_iter ? ksu_wrapper_read_iter : NULL;
+     p->ops.write_iter = fp->f_op->write_iter ? ksu_wrapper_write_iter : NULL;
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)
+     p->ops.iopoll = fp->f_op->iopoll ? ksu_wrapper_iopoll : NULL;
++#endif
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
+     p->ops.iterate = fp->f_op->iterate ? ksu_wrapper_iterate : NULL;
+ #endif
+@@ -392,7 +398,9 @@ static struct ksu_file_wrapper *ksu_create_file_wrapper(struct file *fp)
+     p->ops.fallocate = fp->f_op->fallocate ? ksu_wrapper_fallocate : NULL;
+     p->ops.show_fdinfo = fp->f_op->show_fdinfo ? ksu_wrapper_show_fdinfo : NULL;
+     p->ops.copy_file_range = fp->f_op->copy_file_range ? ksu_wrapper_copy_file_range : NULL;
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)
+     p->ops.remap_file_range = fp->f_op->remap_file_range ? ksu_wrapper_remap_file_range : NULL;
++#endif
+     p->ops.fadvise = fp->f_op->fadvise ? ksu_wrapper_fadvise : NULL;
+ 
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+diff --git a/kernel/infra/seccomp_cache.c b/kernel/infra/seccomp_cache.c
+index a9d2b634..82590a7e 100644
+--- a/kernel/infra/seccomp_cache.c
++++ b/kernel/infra/seccomp_cache.c
+@@ -8,6 +8,25 @@
+ #include "klog.h" // IWYU pragma: keep
+ #include "infra/seccomp_cache.h"
+ 
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)
++
++/* The seccomp bitmap cache was introduced in 5.9. Older kernels have a
++ * different struct seccomp_filter layout and no cache to update, so these
++ * hooks must be no-ops there. */
++void ksu_seccomp_clear_cache(struct seccomp_filter *filter, int nr)
++{
++    (void)filter;
++    (void)nr;
++}
++
++void ksu_seccomp_allow_cache(struct seccomp_filter *filter, int nr)
++{
++    (void)filter;
++    (void)nr;
++}
++
++#else
++
+ struct action_cache {
+     DECLARE_BITMAP(allow_native, SECCOMP_ARCH_NATIVE_NR);
+ #ifdef SECCOMP_ARCH_COMPAT
+@@ -63,3 +82,5 @@ void ksu_seccomp_allow_cache(struct seccomp_filter *filter, int nr)
+     }
+ #endif
+ }
++
++#endif /* LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0) */
+diff --git a/kernel/infra/su_mount_ns.c b/kernel/infra/su_mount_ns.c
+index 1b1ab1df..41b56b3a 100644
+--- a/kernel/infra/su_mount_ns.c
++++ b/kernel/infra/su_mount_ns.c
+@@ -13,7 +13,11 @@
+ #include <linux/syscalls.h>
+ #include <linux/task_work.h>
+ #include <linux/version.h>
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 2, 0)
+ #include <uapi/linux/mount.h>
++#else
++#include <uapi/linux/fs.h>
++#endif
+ 
+ #include "arch.h"
+ #include "klog.h" // IWYU pragma: keep
+diff --git a/kernel/manager/dynamic_manager.c b/kernel/manager/dynamic_manager.c
+index 8c613cb6..4b810226 100644
+--- a/kernel/manager/dynamic_manager.c
++++ b/kernel/manager/dynamic_manager.c
+@@ -9,10 +9,16 @@
+ #include <linux/pid.h>
+ #include <linux/rcupdate.h>
+ #include <linux/sched.h>
++#include <linux/sched/task.h>
+ #include <linux/slab.h>
+ #include <linux/string.h>
+ #include <linux/task_work.h>
+ 
++/* 4.19: task_work_add() takes a bool, not the TWA_* enum (5.9+). */
++#ifndef TWA_RESUME
++#define TWA_RESUME true
++#endif
++
+ #include "klog.h" // IWYU pragma: keep
+ #include "ksu.h"
+ #include "manager/apk_sign.h"
+diff --git a/kernel/manager/pkg_observer.c b/kernel/manager/pkg_observer.c
+index dc785e37..9e50b9d0 100644
+--- a/kernel/manager/pkg_observer.c
++++ b/kernel/manager/pkg_observer.c
+@@ -11,6 +11,11 @@
+ #include "klog.h" // IWYU pragma: keep
+ #include "manager/throne_tracker.h"
+ 
++/* 4.19's task_work_add() takes a bool, not the TWA_* enum (5.9+). */
++#ifndef TWA_RESUME
++#define TWA_RESUME true
++#endif
++
+ #define MASK_SYSTEM (FS_CREATE | FS_MOVE | FS_EVENT_ON_CHILD)
+ 
+ struct watch_dir {
+@@ -54,6 +59,8 @@ static void ksu_defer_track_throne(void)
+     track_throne(false);
+ }
+ 
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
++/* 5.9+: fsnotify_ops.handle_inode_event(mark, mask, inode, dir, qstr_name, cookie) */
+ static int ksu_handle_inode_event(struct fsnotify_mark *mark, u32 mask, struct inode *inode, struct inode *dir,
+                                   const struct qstr *file_name, u32 cookie)
+ {
+@@ -71,6 +78,29 @@ static int ksu_handle_inode_event(struct fsnotify_mark *mark, u32 mask, struct i
+ static const struct fsnotify_ops ksu_ops = {
+     .handle_inode_event = ksu_handle_inode_event,
+ };
++#else
++/* pre-5.9 fsnotify: handle_event(group, inode, mask, data, data_type,
++ * file_name, cookie, iter_info). The name arrives as a NUL-terminated
++ * string in @file_name rather than as a struct qstr. */
++static int ksu_handle_event(struct fsnotify_group *group, struct inode *inode, u32 mask, const void *data,
++                            int data_type, const unsigned char *file_name, u32 cookie,
++                            struct fsnotify_iter_info *iter_info)
++{
++    if (!file_name)
++        return 0;
++    if (mask & FS_ISDIR)
++        return 0;
++    if (!strncmp((const char *)file_name, "packages.list", 13) && file_name[13] == '\0') {
++        pr_info("packages.list detected: %d\n", mask);
++        ksu_defer_track_throne();
++    }
++    return 0;
++}
++
++static const struct fsnotify_ops ksu_ops = {
++    .handle_event = ksu_handle_event,
++};
++#endif
+ 
+ static int add_mark_on_inode(struct inode *inode, u32 mask, struct fsnotify_mark **out)
+ {
+diff --git a/kernel/policy/allowlist.c b/kernel/policy/allowlist.c
+index e5735d67..1e3e87db 100644
+--- a/kernel/policy/allowlist.c
++++ b/kernel/policy/allowlist.c
+@@ -3,6 +3,12 @@
+ #include <linux/rculist.h>
+ #include <linux/mutex.h>
+ #include <linux/task_work.h>
++#include <linux/sched/task.h>
++
++/* 4.19: task_work_add() takes a bool, not the TWA_* enum (5.9+). */
++#ifndef TWA_RESUME
++#define TWA_RESUME true
++#endif
+ #include <linux/capability.h>
+ #include <linux/compiler.h>
+ #include <linux/fs.h>
+diff --git a/kernel/policy/app_profile.c b/kernel/policy/app_profile.c
+index 10d03262..e8f18452 100644
+--- a/kernel/policy/app_profile.c
++++ b/kernel/policy/app_profile.c
+@@ -101,7 +101,9 @@ static void disable_seccomp(void)
+ 
+     current->seccomp.mode = 0;
+     current->seccomp.filter = NULL;
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
+     atomic_set(&current->seccomp.filter_count, 0);
++#endif
+     spin_unlock_irq(&current->sighand->siglock);
+ 
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
+@@ -118,7 +120,12 @@ static void disable_seccomp(void)
+     fake->sighand = NULL;
+ #endif
+ 
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
+     seccomp_filter_release(fake);
++#else
++    /* 4.19 has no seccomp_filter_release(); the detached filter's reference is
++     * intentionally dropped with the task copy. */
++#endif
+     kfree(fake);
+ }
+ 
+diff --git a/kernel/sulog/event.c b/kernel/sulog/event.c
+index 51d6fa84..6d925978 100644
+--- a/kernel/sulog/event.c
++++ b/kernel/sulog/event.c
+@@ -2,7 +2,12 @@
+ #include <linux/compat.h>
+ #include <linux/cred.h>
+ #include <linux/gfp.h>
++#include <linux/version.h>
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
+ #include <linux/minmax.h>
++#else
++#include <linux/kernel.h>
++#endif
+ #include <linux/overflow.h>
+ #include <linux/sched/signal.h>
+ #include <linux/slab.h>
+diff --git a/kernel/supercall/dispatch.c b/kernel/supercall/dispatch.c
+index 9e1ac2c0..461e62a1 100644
+--- a/kernel/supercall/dispatch.c
++++ b/kernel/supercall/dispatch.c
+@@ -7,6 +7,8 @@
+ #include <linux/uaccess.h>
+ #include <linux/version.h>
+ #include <linux/thread_info.h>
++#include <linux/sched/signal.h>
++#include <linux/sched/task.h>
+ #include "uapi/supercall.h"
+ #include "supercall/internal.h"
+ #include "arch.h" // IWYU pragma: keep
+diff --git a/kernel/supercall/supercall.c b/kernel/supercall/supercall.c
+index 6db26495..f8bbed80 100644
+--- a/kernel/supercall/supercall.c
++++ b/kernel/supercall/supercall.c
+@@ -8,6 +8,11 @@
+ #include <linux/slab.h>
+ #include <linux/syscalls.h>
+ #include <linux/task_work.h>
++
++/* 4.19: task_work_add() takes a bool, not the TWA_* enum (5.9+). */
++#ifndef TWA_RESUME
++#define TWA_RESUME true
++#endif
+ #include <linux/uaccess.h>
+ #include <linux/version.h>
+ 

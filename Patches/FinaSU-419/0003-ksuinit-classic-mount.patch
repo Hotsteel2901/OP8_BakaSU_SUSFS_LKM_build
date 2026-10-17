@@ -1,9 +1,9 @@
 diff --git a/userspace/ksuinit/src/init.rs b/userspace/ksuinit/src/init.rs
-index 4f750e3..5d22a5e 100644
+index 92868b3e..938cf71f 100644
 --- a/userspace/ksuinit/src/init.rs
 +++ b/userspace/ksuinit/src/init.rs
 @@ -4,12 +4,8 @@ use std::io::{ErrorKind, Write};
- use anyhow::{Context, Result, ensure};
+ use anyhow::{Context, Result};
  use rustix::fs::{Mode, symlink, unlink};
  use rustix::{
 -    fd::AsFd,
@@ -16,7 +16,7 @@ index 4f750e3..5d22a5e 100644
  };
  
  struct AutoUmount {
-@@ -73,20 +69,14 @@ fn mount_filesystem(name: &str, mountpoint: &str) -> Result<()> {
+@@ -31,20 +27,10 @@ fn mount_filesystem(name: &str, mountpoint: &str) -> Result<()> {
          ErrorKind::AlreadyExists => Ok(()),
          _ => Err(err),
      })?;
@@ -34,13 +34,9 @@ index 4f750e3..5d22a5e 100644
 -        mountpoint,
 -        MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
 -    )?;
-+    // The fsopen()/fsconfig()/fsmount()/move_mount() mount API only exists on
-+    // Linux >= 5.2.  ksuinit runs as the very first userspace process and must
-+    // mount /proc itself before Android's init does (Android init mounts proc
-+    // later, in first_stage_init).  On non-GKI 4.19 the new API returns ENOSYS,
-+    // /proc stays unmounted, /proc/kallsyms cannot be read and init_module()
-+    // fails, so kernelsu.ko never loads.  Use the classic mount(2) syscall,
-+    // which works on every kernel we target (4.19 through GKI).
++    // The fsopen()/fsconfig()/fsmount()/move_mount() API is Linux 5.2+.
++    // Android 4.19 (and older) only has the classical mount(2) syscall, which
++    // works across every supported kernel, so use it unconditionally.
 +    mount(name, mountpoint, name, MountFlags::empty(), "")?;
      Ok(())
  }

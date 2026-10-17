@@ -17,6 +17,7 @@ if [ ! -f "$KO" ]; then
 fi
 
 KSUD=/data/adb/ksud
+[ -x "$KSUD" ] || KSUD=/data/adb/ksu/bin/ksud
 [ -x "$KSUD" ] || KSUD=$(command -v ksud 2>/dev/null)
 if [ -z "$KSUD" ]; then
     log "ksud not found, cannot load $KO"
