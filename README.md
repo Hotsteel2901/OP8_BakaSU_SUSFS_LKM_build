@@ -102,10 +102,13 @@ FinaSU 的 LKM 官方目标是 GKI 5.10+，虽然 README 声称 4.14+，但内�
 6. **PMD 段映射**：4.19 arm64 没有 `pmd_leaf()`/`pud_leaf()`，内核镜像用 2 MiB
    段映射；`phys_from_virt()` 增加 `pmd_sect()`/`pud_sect()` 分支，否则
    `sys_call_table` / `security_hook_heads` 的文本改写会失败。
-7. **ksuinit**：FinaSU 用 `fsopen/fsmount/move_mount`（Linux 5.2+）挂 `/proc`，
+7. **mount helper**：`path_mount()`/`path_umount()` 是 5.9+ 才有的内核内部函数；
+   4.19 用 `do_mount()`/`ksys_umount()` + `KERNEL_DS` 的弱符号兜底，否则
+   `ksuinit` 解析不到这两个符号，`init_module()` 直接失败。
+8. **ksuinit**：FinaSU 用 `fsopen/fsmount/move_mount`（Linux 5.2+）挂 `/proc`，
    4.19 上 `ENOSYS`，导致读不到 `/proc/kallsyms`、`kernelsu.ko` 加载失败；
    改成经典 `mount(2)`。
-8. **boot header v2**：FinaSU `ksud boot-patch` 只接受 header v3/v4；OnePlus 8
+9. **boot header v2**：FinaSU `ksud boot-patch` 只接受 header v3/v4；OnePlus 8
    是 v2，打补丁放行（>4 仍拒绝）。
 
 ### 为什么 LKM 的 syscall hook 在 4.19 能工作
@@ -144,6 +147,7 @@ Patches/
 │   ├── 0002-selinux-419.patch         # SELinux legacy policydb + hide/avc stub
 │   ├── 0003-ksuinit-classic-mount.patch
 │   ├── 0004-ksud-boot-header-v2.patch
+│   ├── 0005-mount-helpers-419.patch   # path_mount/path_umount -> do_mount/ksys_umount
 │   └── README.md                      # 适配地图与迭代方式
 ├── RekernelX/rkx-4.19.patch
 ├── HybridMount/hybridmount_patch_to_4.19.patch

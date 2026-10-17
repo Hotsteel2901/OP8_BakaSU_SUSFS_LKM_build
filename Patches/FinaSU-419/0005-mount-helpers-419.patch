@@ -1,0 +1,89 @@
+--- a/kernel/infra/su_mount_ns.c
++++ b/kernel/infra/su_mount_ns.c
+@@ -12,6 +12,7 @@
+ #include <linux/slab.h>
+ #include <linux/syscalls.h>
+ #include <linux/task_work.h>
++#include <linux/uaccess.h>
+ #include <linux/version.h>
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 2, 0)
+ #include <uapi/linux/mount.h>
+@@ -28,6 +29,31 @@
+ extern int path_mount(const char *dev_name, struct path *path, const char *type_page, unsigned long flags,
+                       void *data_page);
+ 
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)
++/* path_mount() is a 5.9+ kernel-internal helper.  4.19 only has do_mount(),
++ * which takes a user-space path, so resolve the struct path to a string and
++ * pass it with KERNEL_DS.  This mirrors the fallback used by BakaSU/KernelSU
++ * for non-GKI 4.19. */
++__weak int path_mount(const char *dev_name, struct path *path, const char *type_page, unsigned long flags,
++                      void *data_page)
++{
++    char buf[384];
++    char *realpath;
++    mm_segment_t old_fs;
++    long ret;
++
++    realpath = d_path(path, buf, sizeof(buf) - 1);
++    if (IS_ERR(realpath) || realpath == buf)
++        return -ENOENT;
++
++    old_fs = get_fs();
++    set_fs(KERNEL_DS);
++    ret = do_mount(dev_name, (const char __user *)realpath, type_page, flags, data_page);
++    set_fs(old_fs);
++    return ret;
++}
++#endif
++
+ // global mode , need CAP_SYS_ADMIN and CAP_SYS_CHROOT to perform setns
+ static void ksu_mnt_ns_global(void)
+ {
+--- a/kernel/feature/kernel_umount.c
++++ b/kernel/feature/kernel_umount.c
+@@ -1,3 +1,5 @@
++#include <linux/dcache.h>
++#include <linux/err.h>
+ #include <linux/sched.h>
+ #include <linux/slab.h>
+ #include <linux/task_work.h>
+@@ -9,6 +11,8 @@
+ #include <linux/path.h>
+ #include <linux/printk.h>
+ #include <linux/types.h>
++#include <linux/uaccess.h>
++#include <linux/syscalls.h>
+ 
+ #include "feature/kernel_umount.h"
+ #include "klog.h" // IWYU pragma: keep
+@@ -43,6 +47,29 @@
+ 
+ extern int path_umount(struct path *path, int flags);
+ 
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)
++/* path_umount() is a 5.9+ kernel-internal helper.  4.19 has ksys_umount(),
++ * which takes a user-space path; resolve struct path + KERNEL_DS. */
++__weak int path_umount(struct path *path, int flags)
++{
++    char buf[256];
++    char *usermnt;
++    mm_segment_t old_fs;
++    int ret = -ENOENT;
++
++    usermnt = d_path(path, buf, sizeof(buf) - 1);
++    if (!IS_ERR(usermnt) && usermnt != buf) {
++        old_fs = get_fs();
++        set_fs(KERNEL_DS);
++        ret = ksys_umount((char __user *)usermnt, flags);
++        set_fs(old_fs);
++    }
++
++    path_put(path);
++    return ret;
++}
++#endif
++
+ static void ksu_umount_mnt(const char *mnt, struct path *path, int flags)
+ {
+     int err = path_umount(path, flags);

@@ -139,6 +139,30 @@ OnePlus 8 的 boot.img 是 **header v2**。补丁改为打印版本、仅拒绝 
 > `ksud boot-patch` 注入 ramdisk；不要改成 `--kernel`，v2 头下重新布局
 > kernel/ramdisk/dtb 容易把镜像弄坏。
 
+## 0005 — `path_mount()` / `path_umount()` 的 4.19 兼容实现
+
+FinaSU 的 `infra/su_mount_ns.c` 与 `feature/kernel_umount.c` 直接调用内核内部的
+`path_mount()` / `path_umount()`。这两个 helper 是 **5.9+** 才有的；4.19 的
+`System.map` 里没有它们。模块能编译，但 `ksuinit` 从 `/proc/kallsyms` 解析不到
+这两个符号，`init_module()` 会直接失败（CI 的符号自检也会把它标红）。
+
+4.19 可用的是：
+
+- `do_mount(dev_name, dir_name, type_page, flags, data_page)`，但 `dir_name` 是
+  **用户态路径**；
+- `ksys_umount(name, flags)`，同样接收用户态路径。
+
+补丁按 BakaSU/KernelSU 的 4.19 做法，在 `< 5.9` 时提供 `__weak` 版本：
+
+1. `d_path()` 把 `struct path` 转成字符串；
+2. `set_fs(KERNEL_DS)` 临时放宽地址限制；
+3. 调用 `do_mount()` / `ksys_umount()`；
+4. 恢复 `set_fs()`；`path_umount()` 末尾 `path_put()` 释放调用方传入的 path。
+
+这样模块的未定义符号变成 `do_mount` / `ksys_umount`（4.19 都存在），而不是
+不存在的 `path_mount` / `path_umount`。>=5.9 的内核仍走 FinaSU 原实现，弱符号
+只在老内核上编译。
+
 ## 管理器签名（不是补丁，但必须）
 
 FinaSU 内核用 `EXPECTED_SIZE2` / `EXPECTED_HASH2` 认证管理器 APK 的签名证书。

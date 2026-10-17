@@ -298,6 +298,9 @@ drwxr-xr-x 6 root root 0 ... /sys/module/susfs_guard_lkm
   实现（`0002`）；sepolicy 批量命令 ABI 保持不变。
 - FinaSU 的 SELinux hide / AVC spoof 和 seccomp bitmap cache 在 4.19 上编译为
   no-op / stub（`0001`、`0002`），功能降级见根 README“限制”。
+- FinaSU 直接调用 5.9+ 的 `path_mount()` / `path_umount()`；4.19 没有这两个符号，
+  模块能编译但 `ksuinit` 解析不到，`init_module()` 必败。`0005` 用 BakaSU 同款
+  弱符号兜底：`d_path()` + `KERNEL_DS` + `do_mount()` / `ksys_umount()`。
 - FinaSU 的 syscall hook 走 `sys_enter` tracepoint + 影子 dispatcher；4.19 的
   `syscall_trace_enter()` 返回 `regs->syscallno`，因此**不需要** master 的直接
   `sys_call_table` hook。
@@ -309,7 +312,7 @@ Patches/FinaSU-419 全部补丁：
 
 | 校验 | 结果 |
 |---|---|
-| FinaSU `kernelsu.ko` | 编译成功，0 error；vermagic 与 `UTS_RELEASE` 一致 |
+| FinaSU `kernelsu.ko` | 编译成功，0 error；vermagic 与 `UTS_RELEASE` 一致；未定义符号里 `path_mount`/`path_umount` 已被 0005 消除，改为 4.19 存在的 `do_mount`/`ksys_umount` |
 | `ksuinit`（aarch64-musl） | 编译成功，421 KB 静态 ELF；反汇编/源码确认使用 `mount(2)` |
 | host `ksud` | aarch64 与 x86_64 宿主均编译成功；`ksud boot-patch` 正常 |
 | APK 证书提取 | v1.0.4 APK → `0x02cc` / `2d89b5...d448458` |
