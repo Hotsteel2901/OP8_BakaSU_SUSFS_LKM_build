@@ -470,7 +470,9 @@ jobs:
               "$UTS "*) ;;
               *) echo "::error::$name vermagic does not match kernel release '$UTS'"; return 1 ;;
             esac
-            aarch64-linux-gnu-nm -u "$ko" | awk 'NF>=2 {print $2}' | sort -u > /tmp/${name}.undef
+            # Weak undefined symbols are allowed to stay unresolved; the kernel
+            # loader accepts them. Only GLOBAL undefs are fatal.
+            aarch64-linux-gnu-nm -u "$ko" | awk '$1 == "U" {print $2}' | sort -u > /tmp/${name}.undef
             missing=$(comm -23 /tmp/${name}.undef /tmp/kernel_syms.txt || true)
             if [ -n "$missing" ]; then
               echo "::error::$name references symbols missing from the kernel:"
