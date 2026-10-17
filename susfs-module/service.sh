@@ -10,8 +10,9 @@ TAG="susfs_lkm/service"
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [$TAG] $*" >> "$LOG" 2>/dev/null; }
 
-# Already loaded?
-if grep -q '^susfs_guard_lkm ' /proc/modules 2>/dev/null; then
+# Already loaded?  SUSFS hides itself from /proc/modules for every caller
+# (including root), so /sys/module/<name> is the reliable indicator.
+if [ -d /sys/module/susfs_guard_lkm ] || grep -q '^susfs_guard_lkm ' /proc/modules 2>/dev/null; then
     exit 0
 fi
 

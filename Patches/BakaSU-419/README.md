@@ -60,6 +60,32 @@ tracepoint 路径完全一致），handler（`hook/syscall_event_bridge.c`、`fe
 工作流对 `bakasu` 的 LKM 构建参数改为
 `CONFIG_KSU=m CONFIG_KSU_TRACEPOINT_HOOK=y CONFIG_KSU_SYSCALL_TABLE_HOOK=y`。
 
+## 0003 — ksuinit 用经典 mount(2) 挂载 /proc（pre-5.2）
+
+`userspace/ksuinit` 是注入 ramdisk、替换 `/init` 的第一阶段程序。它必须在真正的
+Android init 之前挂载 `/proc`，否则读不到 `/proc/kallsyms`，也就无法把
+`kernelsu.ko` 的未定义符号重写成绝对地址。
+
+BakaSU `main` 用的是 **新 mount API**：
+
+```
+fsopen() -> fsconfig() -> fsmount() -> move_mount()
+```
+
+这四个 syscall 是 **Linux 5.2+** 才有的。Android 4.19 上它们返回 `ENOSYS`，
+`prepare_mount()` 只在日志里写一行 `Cannot mount procfs`，随后
+`/proc/kallsyms` 打不开，`load_module()` 失败，ksuinit 只打印
+`Cannot load kernelsu.ko: Cannot parse kallsyms` 然后继续 exec 真 init——
+设备能正常开机，但管理器显示未安装，SUSFS 模块脚本也因为没有内核 root 而根本不会运行。
+
+补丁把它换回 backslashxx/KernelSU（已验证 4.19 可用的参考实现）所用的经典
+`mount(2)`：`mount(name, mountpoint, name, MountFlags::empty(), "")`。
+经典 syscall 从 4.19 到 GKI 全部可用。
+
+> 真机排查：`dmesg | grep -iE 'KernelSU|kernelsu|Cannot mount procfs'` 应该能看到
+> `Hello, KernelSU!` 和 `Loading kernelsu.ko..`；加载成功后
+> `[ -d /sys/module/kernelsu ]` 为真。
+
 ## 迭代说明
 
 4.19 上还可能有其它文件用到 5.x API（每修好一处，CI 会暴露下一处）。新增补丁按

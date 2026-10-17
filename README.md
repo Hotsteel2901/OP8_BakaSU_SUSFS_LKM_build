@@ -90,6 +90,14 @@
    由 userspace（KernelSU 模块 / `ksud insmod`）在开机后加载。
 6. **SUSFS-LKM 4.19 适配进行中**：上游 `legacy` 分支未构建未验证；本仓库以 CI 编译错误
    为输入迭代补丁（见 `Patches/SUSFS-LKM/README.md`）。
+7. **ksuinit 必须用经典 `mount(2)` 挂 `/proc`**：BakaSU `main` 的 ksuinit 用
+   `fsopen/fsconfig/fsmount/move_mount`（Linux 5.2+），在 4.19 上返回 `ENOSYS`，
+   导致 `/proc/kallsyms` 不可读、`kernelsu.ko` 加载失败（设备能开机但无 root）。
+   本仓库补丁 `Patches/BakaSU-419/0003` 换回经典 mount(2)。
+8. **构建产物会做符号自检**：CI 在打包前把两个 `.ko` 的未定义符号逐个对照
+   `vmlinux`/`System.map`。`make modules` 对未解析符号只给 WARNING；只要有一个符号
+   在运行内核里不存在（例如 4.19 没有 bootconfig 时的 `saved_boot_config`），
+   `init_module()` 就会失败。自检不通过直接 fail。
 
 ## Patches
 

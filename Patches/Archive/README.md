@@ -60,3 +60,102 @@
 3. 干净 4.19 树：RKX + cgroup 干跑/实跑 → `CONFIG_REKERNEL_X=y` → `make drivers/rekernel_x/`
 4. 同树：HM 补丁 0 rej → `CONFIG_HYBRIDMOUNT=y` → `make fs/hybridmount/`；NM setup.sh 固定 commit → `CONFIG_NOMOUNT=y` → `make fs/nomount/`
 5. CI 双跑：`vfs_hybridmount=true` 与 `vfs_nomount=true` 各出一份 boot.img
+
+---
+
+## 2026-10-17:CI 全绿但刷入后两个 LKM 都不加载——ksuinit 的 pre-5.2 mount API + 缺失符号
+
+### 1. 现象
+
+- 工作流（含 `susfs_enable=true`、`vfs_nomount=true`）全部 success，所有校验步骤通过。
+- 刷入 `boot-patched-bakasu-lkm-nomount.img` 后设备**能正常开机**，但：
+  - BakaSU 管理器显示内核未安装 / 无 root；
+  - `susfs-lkm-module.zip` 的脚本没有实际效果（它依赖内核 root 才能执行 `ksud insmod`）。
+- 没有 bootloop、没有明显内核 panic —— 所以第一眼看起来像“模块本身有问题”，实际是
+  **第一阶段的 ksuinit 根本没把 `kernelsu.ko` 交进内核**。
+
+### 2. 定位过程（可复现）
+
+1. 从 CI 下载产物，`tools/boot_info.py` 确认 header v2、kernel/ramdisk 正常；
+   解 LZ4 ramdisk 后确认 `init`(ksuinit)、`init.real`、`kernelsu.ko`、`ksu_block_modules`
+   都已注入 —— **注入流程本身没问题**。
+2. 反汇编 ramdisk 里的 `init`：发现它发出 syscall **429/430/431/432**
+   （`move_mount`/`fsopen`/`fsconfig`/`fsmount`）。这些是 **Linux 5.2+** 的 mount API；
+   本项目的 4.19 内核源码里根本没有这些 syscall（`tgrep __NR_fsopen` 为空）。
+3. 对照 backslashxx/KernelSU（参考仓库，已验证可在 4.19 跑 LKM）的 ksuinit：
+   它用的是经典 `mount(2)`。BakaSU `main` 的 `userspace/ksuinit/src/init.rs` 在
+   某次重构中换成了新 mount API，只面向 GKI 5.10+。
+4. 因果链：新 API 在 4.19 返回 `ENOSYS` → ksuinit 的 `prepare_mount()` 挂不上 `/proc`
+   （只打一行 `Cannot mount procfs`，**不致命、继续走**）→ Android init 要到
+   `first_stage_init.cpp` 才挂 `/proc`，但那已经是 ksuinit exec 真 init 之后 →
+   `kernel_symbols_iter()` 打不开 `/proc/kallsyms` → `load_module()` 失败 →
+   `kernelsu.ko` 从未 `init_module()` → 没有内核 root → SUSFS 的模块脚本也永远不会
+   被执行。
+5. 第二个独立问题：把两个 `.ko` 的未定义符号与本次内核 `System.map` 逐一对比。
+   旧产物里的 `susfs_guard_lkm.ko` 引用了 **`saved_boot_config`**；4.19 没有 bootconfig，
+   该符号不存在。`ksud insmod` 从 `/proc/kallsyms` 解析不到它，`init_module()` 返回
+   `-ENOENT`。`make modules` 对未定义符号只给 WARNING，所以构建一直“成功”。
+
+### 3. 修复
+
+| 修复 | 文件 |
+|---|---|
+| ksuinit 换回经典 `mount(2)`（与已验证的 backslashxx 实现一致） | 新增 `Patches/BakaSU-419/0003-ksuinit-mount-proc-pre52.patch` |
+| `<5.10` 不再引用 `saved_boot_config`（no-op stub） | 已有 `Patches/SUSFS-LKM/0005-...patch`（`62302e3`） |
+| CI 增加**硬校验**：每个 `.ko` 的未定义符号必须存在于本次 `System.map`，vermagic 必须匹配 `UTS_RELEASE` | `.github/workflows/build-lkm.yml` 的 `Verify external modules` 步骤 |
+| SUSFS 模块脚本用 `/sys/module/susfs_guard_lkm` 判重 | `susfs-module/{post-fs-data,service}.sh` |
+
+### 4. 踩坑记录
+
+| 坑 | 说明 |
+|---|---|
+| **`make modules` 的 `WARNING: "sym" undefined` 不是无害的** | 外置模块的未定义符号由 ksuinit/ksud 在加载时用 `/proc/kallsyms` 重写成 `SHN_ABS`；**解析不到任何一个**都会让 `init_module()` 失败。构建阶段只是 WARNING，必须自己拿 `System.map` 做集合校验（`KALLSYMS_ALL=y` 才会有数据符号） |
+| **ksuinit 的失败是“软失败”** | `prepare_mount()` 失败只 log，然后继续 exec 真 init，所以设备照常开机；症状被伪装成“管理器不认内核”，而不是“模块加载失败”。排查时一定要看 `dmesg` 里的 `Cannot mount procfs` / `Cannot parse kallsyms` |
+| **Android init 挂 `/proc` 的时机** | `/proc` 是 `first_stage_init.cpp` 里由**真 init**挂的；任何替换 `/init` 的第一阶段程序都必须自己挂 `/proc` 才能读 kallsyms |
+| **新 mount API 的适用内核** | `fsopen/fsconfig/fsmount/move_mount` 全部要 5.2+；4.19 上返回 ENOSYS。不要假设“BakaSU main 面向 Android 就能在 4.19 跑”——它的默认目标是 GKI 5.10+ |
+| **bootconfig 也是 5.x 特性** | `saved_boot_config` 在 4.19 不存在。任何引用它的模块都会在 `insmod` 时挂；需要按 `LINUX_VERSION_CODE < 5.10` 门控 |
+| **vermagic / localversion 必须与内核一致** | `.scmversion` 会进 `UTS_RELEASE`；内核和模块必须在同一棵树、同一 `out/` 下构建。`git rev-parse --short` 在浅克隆里长度可能不同，但只要内核和模块同批构建就一致 |
+| **SUSFS 会从 `/proc/modules` 自隐藏** | 模块加载成功后 `lsmod`/`/proc/modules` 都看不到它（包括 root）。判重必须看 `/sys/module/susfs_guard_lkm`，`/proc/modules` 的检查永远为假 |
+| **本地 O= 构建的源树要求干净** | 见上一节：in-tree 残留会让 O= 构建出现 `asm/types.h not found` 之类的怪错；本地复测先 `git clean -fdx`（本仓库用独立 worktree 规避） |
+| **本地 Rust 交叉编译 musl** | 主机没有 `aarch64-linux-gnu-gcc` 时，可给 rustup 的 `aarch64-unknown-linux-musl` 目标设 `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld` + `RUSTFLAGS=-C link-self-contained=yes`；CI 走的是 `aarch64-linux-gnu-gcc` |
+| **NoMount 的固定 commit 拉取可能瞬时 TLS 失败** | 本项目 `setup.sh` 会先 clone 再 `fetch --all --tags`；网络抖动会让脚本在 fetch 阶段退出。重试 fetch / 手动 checkout 固定 commit，然后补做 symlink + 两处接线即可（脚本是幂等的） |
+
+### 5. 本地验证（2026-10-17，全部通过）
+
+构建组合：内核 `98a7970af93b`（= 新基底 boot.img 的内核 commit）+ RKX/DroidSpaces +
+`CONFIG_NOMOUNT=y` + `CONFIG_KEYS/ASSOCIATIVE_ARRAY=y` + no-LTO/CFI；BakaSU `main`
+`2489b385` + 3 个 4.19 补丁；SUSFS `legacy` `0b197bf` + 5 个补丁。
+
+| 校验 | 结果 |
+|---|---|
+| 内核 Image | 编译成功，`4.19.325-cip136-st20-perf-g98a7970af93b-hotsteel-BakaSU-LKM` |
+| `CONFIG_NOMOUNT` / `KEYS` / `ASSOCIATIVE_ARRAY` / `REKERNEL_X` | 全部 `=y`（olddefconfig 后复核） |
+| `kernelsu.ko` | 222 个未定义符号，对 `System.map` **0 缺失** |
+| `susfs_guard_lkm.ko` | 89 个未定义符号，**0 缺失**；无 `saved_boot_config` |
+| vermagic | 两个模块均与内核 `UTS_RELEASE` 完全一致 |
+| ksuinit | 反汇编 0 处 syscall 429–432，存在 `mount(2)`（syscall 40） |
+| 端到端 | `swap_kernel.py`（新基底）+ `ksud boot-patch` 成功；最终 boot.img 100663296 B、header v2，ramdisk 内 init/kernelsu.ko 的 md5 与构建产物一致 |
+| NoMount 内置确认 | `CONFIG_NOMOUNT=y` 进了 `.config`，`fs/nomount/nomount.o` 参与链接，`vmlinux` 中有 `__initcall_nomount_init5`；最终 boot.img 的 kernel 里 `extract-ikconfig` 仍能看到 `CONFIG_NOMOUNT=y` |
+
+本地产物（2026-10-17，nomount 组合）位于 `~/桌面/op8-local-build-nomount/`：
+
+| 文件 | sha256 |
+|---|---|
+| `boot-patched-bakasu-lkm-nomount-local.img` | `02c961d209353702cb19d8b49bca15d6476c3b2a9f004cbd5103358c92d1351d` |
+| `kernelsu.ko` | `3aafebd489abbfaa890f562bdf733a03c29ec0d99ed5296a59392f1329a99311` |
+| `susfs_guard_lkm.ko` | `418b1b947a0659c61abe4030e4b1af98b0693078393c3a001033adf0e05d5d5a` |
+| `susfs-lkm-module-nomount.zip` | `6c4c2a521aa3650f8ec72bbca25b6991743c0fe1113487fb120c6df96bfd8c53` |
+
+> 设备侧验证仍未做（本机无法启动该 arm64 Android 内核）。刷入后按
+> `dmesg | grep -iE 'KernelSU|kernelsu|Cannot mount procfs'`、
+> `[ -d /sys/module/kernelsu ]`、`/data/adb/susfs_lkm.log`、
+> `[ -d /sys/module/susfs_guard_lkm ]` 检查。
+
+### 6. 回归清单增量
+
+1. 任何一个 `.ko` 出现 `WARNING: "..." undefined` 时，必须对照本次 `vmlinux`/`System.map`
+   确认该符号真实存在（CI 的 `Verify external modules` 已自动化）。
+2. 修改 ksuinit 后检查：编译出的 aarch64 二进制不应含 syscall 429–432（可用
+   `llvm-objdump -d` 搜 `w8, #0x1ad..0x1b0`），且应包含经典 `mount(2)`。
+3. `vfs_nomount=true` 构建后确认 `.config` 里 `CONFIG_NOMOUNT=y` 且
+   `fs/nomount/nomount.o` 被编译进 `vmlinux`。

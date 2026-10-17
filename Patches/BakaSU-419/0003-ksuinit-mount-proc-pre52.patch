@@ -1,0 +1,47 @@
+diff --git a/userspace/ksuinit/src/init.rs b/userspace/ksuinit/src/init.rs
+index 4f750e3..5d22a5e 100644
+--- a/userspace/ksuinit/src/init.rs
++++ b/userspace/ksuinit/src/init.rs
+@@ -4,12 +4,8 @@ use std::io::{ErrorKind, Write};
+ use anyhow::{Context, Result, ensure};
+ use rustix::fs::{Mode, symlink, unlink};
+ use rustix::{
+-    fd::AsFd,
+     fs::{Access, CWD, FileType, access, makedev, mkdir, mknodat},
+-    mount::{
+-        FsMountFlags, FsOpenFlags, MountAttrFlags, MoveMountFlags, UnmountFlags, fsconfig_create,
+-        fsmount, fsopen, move_mount, unmount,
+-    },
++    mount::{MountFlags, UnmountFlags, mount, unmount},
+ };
+ 
+ struct AutoUmount {
+@@ -73,20 +69,14 @@ fn mount_filesystem(name: &str, mountpoint: &str) -> Result<()> {
+         ErrorKind::AlreadyExists => Ok(()),
+         _ => Err(err),
+     })?;
+-    let fs_fd = fsopen(name, FsOpenFlags::FSOPEN_CLOEXEC)?;
+-    fsconfig_create(fs_fd.as_fd())?;
+-    let mount_fd = fsmount(
+-        fs_fd.as_fd(),
+-        FsMountFlags::FSMOUNT_CLOEXEC,
+-        MountAttrFlags::empty(),
+-    )?;
+-    move_mount(
+-        mount_fd.as_fd(),
+-        "",
+-        CWD,
+-        mountpoint,
+-        MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
+-    )?;
++    // The fsopen()/fsconfig()/fsmount()/move_mount() mount API only exists on
++    // Linux >= 5.2.  ksuinit runs as the very first userspace process and must
++    // mount /proc itself before Android's init does (Android init mounts proc
++    // later, in first_stage_init).  On non-GKI 4.19 the new API returns ENOSYS,
++    // /proc stays unmounted, /proc/kallsyms cannot be read and init_module()
++    // fails, so kernelsu.ko never loads.  Use the classic mount(2) syscall,
++    // which works on every kernel we target (4.19 through GKI).
++    mount(name, mountpoint, name, MountFlags::empty(), "")?;
+     Ok(())
+ }
+ 
