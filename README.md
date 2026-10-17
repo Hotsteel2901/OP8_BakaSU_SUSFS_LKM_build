@@ -98,6 +98,11 @@
    `vmlinux`/`System.map`。`make modules` 对未解析符号只给 WARNING；只要有一个符号
    在运行内核里不存在（例如 4.19 没有 bootconfig 时的 `saved_boot_config`），
    `init_module()` 就会失败。自检不通过直接 fail。
+9. **SUSFS 的 `phys_from_virt()` 必须识别 PMD 段映射**：4.19 arm64 只有
+   `pmd_sect()`/`pud_sect()`，没有 5.x 的 `pmd_leaf()`/`pud_leaf()`；内核镜像
+   （含 `security_hook_heads`）用 2 MiB 段映射，缺了 `#elif defined(pmd_sect)`
+   会让 LSM hook 插入失败（`-ENOENT`），fatal 的 `sus_path` 层直接拒绝整个模块。
+   补丁见 `Patches/SUSFS-LKM/0006`。
 
 ## Patches
 

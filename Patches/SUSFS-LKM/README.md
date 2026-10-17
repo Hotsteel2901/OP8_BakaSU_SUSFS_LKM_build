@@ -16,7 +16,11 @@
 > `susfs_guard_lkm.ko`。再加两道静态校验：全部未定义符号都能在内核
 > `System.map`/`kallsyms` 中找到（KALLSYMS_ALL=y），且 vermagic 与内核 UTS_RELEASE
 > 一致——这是 `ksud insmod` 能从 `/proc/kallsyms` 完成重定位、`init_module()` 不返回
-> `-ENOENT` 的前提。CI 已把这两项做成硬校验。加载后的功能行为仍需真机验证。
+> `-ENOENT` 的前提。CI 已把这两项做成硬校验。
+>
+> **真机已验证（2026-10-17，OnePlus 8 / 4.19.325）**：`ksud insmod` 成功，
+> `/sys/module/susfs_guard_lkm` 与 `/proc/susfs_*` 控制节点都存在，
+> `/proc/modules` 中看不到 susfs（自隐藏生效）。
 
 ## 为什么这条路对我们的价值
 
@@ -58,6 +62,10 @@ SUSFS 可以独立升级、不依赖 in-tree SUSFS 补丁（也绕开上游 Baka
    静态断言里删掉。
 5. **符号集审计**：`nm -u susfs_guard_lkm.ko` 的每个名字都要在 `vmlinux`/`System.map`
    里（如 Android 专有 `sized_strscpy` 4.19 未必有）。构建日志里会打印未定义符号。
+6. **页表段映射（`pmd_sect`）**：4.19 arm64 没有 `pmd_leaf()`/`pud_leaf()`，只有
+   `pmd_sect()`/`pud_sect()`；`patch_memory.c` 的 `phys_from_virt()` 必须补
+   `#elif defined(pmd_sect)` 分支，否则 2 MiB 段映射的内核 rodata（含
+   `security_hook_heads`）无法定位物理页，LSM hook 插入返回 `-ENOENT`。
 
 ### C. 加载/加载器（最容易出问题）
 - GKI 世界用 loader 从 `/proc/kallsyms` 绝对化未定义符号、绕过 export/CRC/KMI。
@@ -84,6 +92,7 @@ SUSFS 可以独立升级、不依赖 in-tree SUSFS 补丁（也绕开上游 Baka
 | `0002-sus_path-drop-path_notify-pre52.patch` | `path_notify` 是 5.2+ 的 LSM hook，4.19 的 `security_hook_heads`/`security_list_options` 没有该成员。按 `>= 5.2` 门控掉该 hook（前向声明、静态断言、hook 结构体、处理函数、注册/注销列表项），4.19 上不安装它。 |
 | `0003-susfs_kstat-syscall_get_arguments-5args.patch` | 本 4.19 树的 arm64 `syscall_get_arguments` 是 **5 参**形式 `(task, regs, i, n, args)`，而源码用的是 3 参。改为 `(current, regs, 0, 6, args)`。 |
 | `0005-spoof_cmdline-no-bootconfig-pre510.patch` | 4.19 没有 bootconfig，`saved_boot_config` 符号不存在；`spoof_cmdline.c` 引用它会让 `.ko` 留下一个 ksud 无法从 `/proc/kallsyms` 解析的未定义符号，`init_module()` 直接 `-ENOENT`。`< 5.10` 改为 no-op stub（该功能本来也不存在）。 |
+| `0006-patch_memory-pmd_sect-pre54.patch` | 4.19 arm64 没有 `pmd_leaf()`/`pud_leaf()`（只有 `pmd_sect()`/`pud_sect()`）。`patch_memory.c` 的 `phys_from_virt()` 只识别 leaf，PMD 段映射会被 `pmd_bad()` 当成坏表项 → `-ENOENT`，`security_hook_heads` 的 LSM 插入失败，fatal 的 `sus_path` 层拒绝整个模块加载（dmesg: `failed to find phy addr for patch dst ...`）。补上 `#elif defined(pmd_sect)` / `pud_sect` 分支（与 BakaSU 的 arm64 实现一致）。 |
 
 ## 迭代方式
 

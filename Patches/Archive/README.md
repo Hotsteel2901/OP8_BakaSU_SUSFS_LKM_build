@@ -143,8 +143,8 @@
 |---|---|
 | `boot-patched-bakasu-lkm-nomount-local.img` | `02c961d209353702cb19d8b49bca15d6476c3b2a9f004cbd5103358c92d1351d` |
 | `kernelsu.ko` | `3aafebd489abbfaa890f562bdf733a03c29ec0d99ed5296a59392f1329a99311` |
-| `susfs_guard_lkm.ko` | `418b1b947a0659c61abe4030e4b1af98b0693078393c3a001033adf0e05d5d5a` |
-| `susfs-lkm-module-nomount.zip` | `6c4c2a521aa3650f8ec72bbca25b6991743c0fe1113487fb120c6df96bfd8c53` |
+| `susfs_guard_lkm.ko` | `8fb40093e58140721953775572e9c30b8cda86b2a3365681aaadca9fc65c6dc0`（含 `0006` 修复） |
+| `susfs-lkm-module-nomount.zip` | `02fdcac17e94fafcfbb0d784d35bb6849f39dfcebd9d0b3943f699548db3667b`（含 `0006` 修复） |
 
 > 设备侧验证仍未做（本机无法启动该 arm64 Android 内核）。刷入后按
 > `dmesg | grep -iE 'KernelSU|kernelsu|Cannot mount procfs'`、
@@ -159,3 +159,114 @@
    `llvm-objdump -d` 搜 `w8, #0x1ad..0x1b0`），且应包含经典 `mount(2)`。
 3. `vfs_nomount=true` 构建后确认 `.config` 里 `CONFIG_NOMOUNT=y` 且
    `fs/nomount/nomount.o` 被编译进 `vmlinux`。
+
+---
+
+## 2026-10-17（续）：BakaSU 正常后，SUSFS-LKM 仍被内核拒绝——4.19 没有 `pmd_leaf`
+
+### 1. 现象与日志
+
+修复 ksuinit 后，BakaSU 正常加载并工作（`/proc/modules` 可见 `kernelsu`），但
+`susfs_guard_lkm.ko` 仍然 `insmod` 失败。`/data/adb/susfs_lkm.log`：
+
+```
+init_module failed without vermagic mismatch
+No such file or directory (os error 2)
+```
+
+用 root 读 dmesg（`kptr_restrict=2` 时普通 `dmesg`/`kallsyms` 全是 0，需先
+`echo 0 > /proc/sys/kernel/kptr_restrict`）：
+
+```
+susfs_guard_lkm: init v2.3.0-gki
+susfs_guard_lkm: symbol_resolver: kprobe bootstrap (1 = usable): lookup_name=1 lookup=1 walker=1 match=0
+susfs_guard_lkm: lsm_hook: init, tracked hooks=0
+susfs_guard_lkm: sus_path: hooks deferred until the first rule
+susfs_guard_lkm: failed to find phy addr for patch dst 0xffffff96d2b2e000
+susfs_guard_lkm: lsm_hook: failed to insert inode_getattr at the head of its list: -2
+susfs_guard_lkm: sus_path: getattr hook failed -2 - nothing would be hidden, refusing to load
+susfs_guard_lkm: susfs_guard_lkm: sus_path init failed -2, refusing to load
+```
+
+说明：**符号全部解析成功、vermagic 也匹配**（否则错误不同），模块已进入
+`susfs_init()`；失败点是 fatal 的 `sus_path` 层在往 `security_hook_heads` 插入 LSM
+hook 时，`ksu_patch_text()` 找不到目标地址的物理页。
+
+### 2. 定位
+
+真机运行地址（root + `kptr_restrict=0`）：
+
+| 符号 | 运行时地址 |
+|---|---|
+| `_text` | `0xffffff96d0280000` |
+| `security_hook_heads` | `0xffffff96d2b2de68` |
+| 失败 patch dst | `0xffffff96d2b2e000`（= `security_hook_heads + 0x198`，即 `offsetof(inode_getattr)`） |
+
+关键事实：
+
+1. arm64 39-bit VA + KASLR 把内核镜像映射到 vmalloc 区（`0xffffff96d0...`），内核
+   text/rodata 用 **2 MiB PMD 段映射**。
+2. 4.19 arm64 的页表头文件只提供 `pmd_sect()` / `pud_sect()`，**没有**
+   `pmd_leaf()` / `pud_leaf()`（后者是 5.x 才统一的命名）。
+3. SUSFS 的 `kernel/patch_memory.c::phys_from_virt()` 只写了
+   `#if defined(pmd_leaf)` / `#if defined(pud_leaf)` 分支；在 4.19 上这些分支被
+   预处理器整体去掉，段映射继续走到 `pmd_bad()`。`pmd_bad()` 对 section 表项
+   （`PMD_TABLE_BIT` 未置位）返回 true → `goto fail` → `-ENOENT`。
+4. BakaSU 的 `kernelsu.ko` 之所以能改 `sys_call_table`，是因为它的
+   `hook/arm64/patch_memory.c` 本来就有 `#elif defined(pmd_sect)` /
+   `#elif defined(pud_sect)` 兜底（正是为 4.19 的 rodata 段映射加的）。SUSFS 的
+   移植版本把这段丢了。
+
+### 3. 修复
+
+`Patches/SUSFS-LKM/0006-patch_memory-pmd_sect-pre54.patch`：
+
+```c
+#if defined(pud_leaf)
+    if (pud_leaf(*pud)) ...
+#elif defined(pud_sect)
+    if (pud_sect(*pud))
+        return __pud_to_phys(*pud) + (addr & ~PUD_MASK);
+#endif
+...
+#if defined(pmd_leaf)
+    if (pmd_leaf(*pmd)) ...
+#elif defined(pmd_sect)
+    if (pmd_sect(*pmd))
+        return __pmd_to_phys(*pmd) + (addr & ~PMD_MASK);
+#endif
+```
+
+`__pmd_to_phys()` / `__pud_to_phys()` / `pmd_pte()` 在 4.19 arm64 都已存在，无需额外 shim。
+
+### 4. 真机验证（2026-10-17）
+
+```
+# ksud insmod /data/local/tmp/susfs_fixed.ko
+Loaded kernel module: /data/local/tmp/susfs_fixed.ko
+
+# dmesg | tail
+susfs_guard_lkm: sus_path: listing filter armed (2/2 ABIs: l64=__arm64_sys_getdents64 compat=__arm64_compat_sys_getdents)
+susfs_guard_lkm: sus_path: hooks armed (LSM + dirent kretprobes)
+susfs_guard_lkm: susfs supercall: armed (reboot ABI, version v2.3.0)
+susfs_guard_lkm: loaded. This module is filtered out of /proc/modules ...
+
+# ls -ld /sys/module/susfs_guard_lkm
+drwxr-xr-x 6 root root 0 ... /sys/module/susfs_guard_lkm
+# ls /proc/susfs_*        -> avc_spoof enable_log hide_modules hide_mounts kstat open_redirect path
+# grep -c susfs /proc/modules    -> 0   (自隐藏生效)
+```
+
+用 `ksud module install` 把修好的 zip 装到 `/data/adb/modules_update/susfs_lkm/`
+（md5 与本地构建一致），下次重启由 post-fs-data 自动加载。
+
+### 5. 本次新增踩坑
+
+| 坑 | 说明 |
+|---|---|
+| **`pmd_leaf` ≠ `pmd_sect`** | 4.19 arm64 只有 `pmd_sect`/`pud_sect`。任何从 5.x/6.x 抄来的 `phys_from_virt` 都必须补 `#elif defined(pmd_sect)`，否则 2 MiB 段映射的内核 text/rodata 无法被 fixmap 改写 |
+| **KASLR 后内核镜像在 vmalloc 区** | 39-bit VA 下 `_text` 可能在 `0xffffff96...`，不要用链接地址（`ffffff80...`）判断映射方式；用 `kptr_restrict=0` 后的 `/proc/kallsyms` 读真实地址 |
+| **fatal 层会把真实错误淹没** | `sus_path` 是 fatal 层，它的失败让整个模块 `init` 返回 `-2`；ksud 只显示 `init_module failed`。必须看 dmesg 里 `susfs_guard_lkm:` 开头的逐层日志 |
+| **`kptr_restrict=2` 时连 root 都看到 0** | 排查时先 `echo 0 > /proc/sys/kernel/kptr_restrict`（root/CAP_SYSLOG），否则 `/proc/kallsyms` 地址全为 0 |
+| **`ksud module install` 是延迟生效** | 新文件被放进 `/data/adb/modules_update/<id>/`，活动目录里的旧 `.ko` 不会立即替换，并写入 `update` 标记，重启后才切换。验证时对比两边 md5 |
+| **已加载模块不要重复 insmod** | SUSFS 从 `/proc/modules` 自隐藏，重复 `insmod` 返回 `-EEXIST`，看起来像“被拒”；判重看 `/sys/module/susfs_guard_lkm` |
