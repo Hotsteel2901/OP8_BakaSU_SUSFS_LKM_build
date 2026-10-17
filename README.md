@@ -13,6 +13,19 @@
 [LyraVoid/FinaSU](https://github.com/LyraVoid/FinaSU)**；内核、SUSFS-LKM、RKX/DS、
 VFS 后端等机制沿用 `master`。BakaSU 版本仍在 `master` 分支。
 
+### 当前状态
+
+- 分支 [`finasu`](https://github.com/Hotsteel2901/OP8_BakaSU_SUSFS_LKM_build/tree/finasu)
+  已推送。
+- CI 全绿（2026-10-17，`susfs_enable=true`，内核 `lineage-23.2`，
+  [run 39051940060](https://github.com/Hotsteel2901/OP8_BakaSU_SUSFS_LKM_build/actions/runs/39051940060)）：
+  内核 `4.19.325-...-g98a7970af-hotsteel-FinaSU-LKM`；`kernelsu.ko` 211 个未定义
+  符号、`susfs_guard_lkm.ko` 89 个未定义符号全部在 `System.map` 中；boot.img
+  header v2 重打包成功。
+- 产物 `boot-patched-finasu-lkm.zip`（含 boot.img / kernelsu.ko / susfs_guard_lkm.ko /
+  susfs-lkm-module.zip）可直接从该 run 下载。
+- **尚未真机刷入验证**；刷机风险与验证清单见文末。
+
 ---
 
 ## 与 `master`（BakaSU）的区别

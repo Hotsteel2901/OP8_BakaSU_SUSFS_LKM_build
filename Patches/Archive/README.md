@@ -317,8 +317,10 @@ Patches/FinaSU-419 全部补丁：
 | host `ksud` | aarch64 与 x86_64 宿主均编译成功；`ksud boot-patch` 正常 |
 | APK 证书提取 | v1.0.4 APK → `0x02cc` / `2d89b5...d448458` |
 | boot-patch（v2 基座） | 成功；ramdisk 内 `init` 与新编 `ksuinit` 逐字节一致，`init.real` + `kernelsu.ko` 均在 |
-| 符号/vermagic 自检 | CI 步骤沿用 master；本地模块未做真机 `init_module()` |
+| 符号/vermagic 自检 | CI 全绿（run 39051940060）：kernelsu.ko 211 / SUSFS 89 个未定义符号全部命中 System.map，vermagic 一致 |
+| GitHub Actions | 26m49s 全绿，artifact `boot-patched-finasu-lkm` 上传成功 |
 
-> 真机刷入/开机验证尚未进行。刷入后优先看 `dmesg | grep -iE 'KernelSU|kernelsu|Cannot mount procfs'`、
+> CI 已全绿（2026-10-17，run 39051940060），产物 boot.img 的 ramdisk 内
+> `init`（ksuinit）与 `kernelsu.ko` 已核对；尚未真机刷入。刷入后优先看 `dmesg | grep -iE 'KernelSU|kernelsu|Cannot mount procfs'`、
 > 管理器是否识别 LKM、`/data/adb/susfs_lkm.log`。FinaSU 管理器需与构建时
 > `manager_ref` 对应（默认 `latest` = 最新 Release）。
